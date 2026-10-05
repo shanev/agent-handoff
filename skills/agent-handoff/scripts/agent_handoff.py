@@ -26,7 +26,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 RESULT_MARK = "AGENT_HANDOFF_RESULT:"
 HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "agent-handoff"
@@ -242,6 +242,10 @@ class Claude(Adapter):
     kind = binary = "claude"
     config_var, default_root = "CLAUDE_CONFIG_DIR", ".claude"
     verbatim = ("file-history",)
+    # A machine where claude was never set up or isn't logged in. herdr reports
+    # these as idle, so they must be recognised by their text.
+    user_screens = {"first_run_setup": r"Let's get started|Choose the text style",
+                    "login": r"Select login method|Not logged in"}
     trust_marker = r"trust this folder"
     trust_yes = r"Yes, I trust"
 
@@ -499,11 +503,23 @@ def exit_agent(pane: str, adapter: Adapter) -> None:
     herdr("pane", "send-keys", pane, "enter")
     try:
         wait_for_shell(pane, 20)
+        return
     except HandoffError:
+        pass
+    # Not at a prompt that takes /exit (e.g. a first-run or login screen). TUIs
+    # quit on a second ctrl+c within about a second, and a screen change can eat
+    # one, so send quick pairs a few times.
+    for _ in range(3):
         herdr("pane", "send-keys", pane, "ctrl+c")
         time.sleep(0.3)
         herdr("pane", "send-keys", pane, "ctrl+c")
-        wait_for_shell(pane, 10)
+        try:
+            wait_for_shell(pane, 1.5)
+            return
+        except HandoffError:
+            continue
+    raise HandoffError(f"{adapter.kind} in {pane} didn't quit (tried {adapter.exit_text} and ctrl+c); "
+                       f"it may be showing a screen that needs the user")
 
 
 def start_agent(name: str, kind: str, pane: str, args: List[str]) -> dict:
@@ -822,6 +838,15 @@ REMOTE_STEPS = {"probe": step_probe, "prepare": step_prepare, "start": step_star
 # ---------------------------------------------------------------- source side
 
 
+def identity(repo: str) -> List[str]:
+    """`-c` flags giving git a placeholder author for this tool's internal
+    commits (the WIP snapshot, the source stash) on machines with no git
+    identity, e.g. a fresh server. Empty when the user has one configured."""
+    if git(repo, "config", "user.email", check=False) and git(repo, "config", "user.name", check=False):
+        return []
+    return ["-c", "user.name=agent-handoff", "-c", "user.email=agent-handoff@localhost"]
+
+
 def make_wip(repo: str) -> Optional[str]:
     """Snapshot tracked + untracked (non-ignored) changes as a commit object
     without touching the branch, index or working tree."""
@@ -834,7 +859,8 @@ def make_wip(repo: str) -> Optional[str]:
         tree = git(repo, "write-tree", index_file=tmp_index)
     if tree == git(repo, "rev-parse", "HEAD^{tree}"):
         return None
-    return git(repo, "commit-tree", tree, "-p", "HEAD", "-m", "agent-handoff wip")
+    return run(["git", *identity(repo), "-C", repo, "commit-tree", tree, "-p", "HEAD",
+                "-m", "agent-handoff wip"]).strip()
 
 
 def path_rewriter(pairs: List[Tuple[str, str]]):
@@ -1049,8 +1075,8 @@ def cmd_send(args) -> None:
 
     stashed = False
     if wip and not args.keep_source_changes:
-        git(src_root, "stash", "push", "-q", "--include-untracked",
-            "-m", f"agent-handoff: {sid8} moved to {where}" + (f" ({prep['worktree']})" if args.target == LOCAL else ""))
+        run(["git", *identity(src_root), "-C", src_root, "stash", "push", "-q", "--include-untracked",
+            "-m", f"agent-handoff: {sid8} moved to {where}" + (f" ({prep['worktree']})" if args.target == LOCAL else "")])
         stashed = True
     print(json.dumps({
         "ok": True, **plan, "target_worktree": prep["worktree"], "target_branch": prep["branch"],

@@ -294,6 +294,16 @@ class GitTransport(TempDirTest):
         self.assertEqual(sh("git", "status", "--porcelain", cwd=self.src), before)
         self.assertEqual(sh("git", "show", f"{wip}:new.txt", cwd=self.src), "untracked")
 
+    def test_wip_works_without_a_git_identity(self):
+        # a fresh server: no user.name/email in config or environment
+        (self.src / "a.txt").write_text("changed\n")
+        no_id = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_AUTHOR", "GIT_COMMITTER"))}
+        no_id.update(EMAIL="", HOME=str(self.tmp / "empty-home"))
+        with mock.patch.dict(os.environ, no_id, clear=True):
+            self.assertEqual(ah.identity(str(self.src)), ["-c", "user.name=agent-handoff",
+                                                          "-c", "user.email=agent-handoff@localhost"])
+            self.assertTrue(ah.make_wip(str(self.src)))
+
     def test_clean_tree_has_no_wip(self):
         self.assertIsNone(ah.make_wip(str(self.src)))
 
@@ -453,6 +463,16 @@ class TrustScreen(unittest.TestCase):
     def test_no_screen(self):
         with mock.patch.object(ah, "run", return_value="❯ "), mock.patch.object(ah.time, "sleep"):
             self.assertEqual(ah.answer_trust("w1:p1", ah.ADAPTERS["claude"], True), "none")
+
+
+class UserScreens(unittest.TestCase):
+    def test_claude_first_run_and_login_are_recognised(self):
+        screens = ah.ADAPTERS["claude"].user_screens
+        first_run = " Let's get started.\n Choose the text style that looks best with your terminal\n"
+        login = " Select login method:\n ❯ 1. Claude account with subscription\n"
+        self.assertEqual([k for k, rx in screens.items() if __import__("re").search(rx, first_run)],
+                         ["first_run_setup"])
+        self.assertEqual([k for k, rx in screens.items() if __import__("re").search(rx, login)], ["login"])
 
 
 class StartAgent(unittest.TestCase):

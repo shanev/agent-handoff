@@ -1,7 +1,7 @@
 ---
 name: agent-handoff
 description: "Move a running coding-agent session (Claude Code, Codex, omp, pi, grok) from one machine to another over SSH, with its transcript, branch and uncommitted changes, and resume it in herdr on the target. Use when the user asks to hand off, move, transfer, or continue an agent session on another machine/host (e.g. 'move the hark claude to vega'), or on this machine into another checkout or its own worktree. Requires herdr on both machines."
-version: 0.4.2
+version: 0.4.3
 author: Shane Vitarana
 license: MIT
 platforms: [macos, linux]
@@ -66,6 +66,7 @@ If this is the first handoff to a machine, run `doctor <ssh-target>` first. Repo
 5. Run `send`. Report the target worktree, branch, whether uncommitted changes moved, and the `attach` line (`herdr --remote <target>`).
 6. If `target_waiting_for_user` is not empty, the agent on the target is showing a screen the user must answer, and the script never answers these. Tell the user what it is, and don't send the agent prompts until they've dealt with it (a prompt's Enter would land on that screen):
    - `hook_review`: Codex wants approval for a new or changed hook, usually the herdr hook the handoff just installed. Approving it lets herdr track Codex's state on that machine. Escape skips it, and hooks then don't run.
+   - `first_run_setup` / `login`: the agent has never been set up, or isn't logged in, on the target. The session is copied over and will resume once the user attaches, finishes setup and logs in.
    - `unrecognized_prompt`: the agent stopped on a screen this tool doesn't know (often after an agent update reworded one). The user should attach and look.
 7. If `send` fails, quote its `error`. It ends with what to do (`--new-branch`, `--dir`, install something, wait for the agent).
 
