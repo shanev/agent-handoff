@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 RESULT_MARK = "AGENT_HANDOFF_RESULT:"
 HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "agent-handoff"
@@ -38,6 +38,7 @@ class HandoffError(Exception):
 
 
 LOGIN_PATH: Optional[str] = None  # set by adopt_login_path() on the target
+LOGIN_ENV: Dict[str, str] = {}     # agent config vars (CLAUDE_CONFIG_DIR, ...) from the login shell
 
 
 def resolve(cmd: List[str]) -> List[str]:
@@ -82,20 +83,29 @@ def log(msg: str) -> None:
     print(f"agent-handoff: {msg}", file=sys.stderr, flush=True)
 
 
+CONFIG_VARS = ("CLAUDE_CONFIG_DIR", "CODEX_HOME")
+
+
 def adopt_login_path() -> None:
-    """Non-interactive ssh gets a bare PATH; resolve commands against the login
-    shell's PATH so herdr, claude, codex, omp (often in /opt/homebrew/bin or
-    ~/.local/bin) are found."""
+    """Non-interactive ssh gets a bare environment. Read the login shell's PATH
+    (so herdr, claude, codex, omp in /opt/homebrew/bin or ~/.local/bin resolve)
+    and the agents' config-dir variables. Uses `env` so it works in any shell;
+    only the variables named here are kept."""
     global LOGIN_PATH
     shell = os.environ.get("SHELL") or "/bin/sh"
     try:
-        out = subprocess.run([shell, "-ilc", 'printf "\\n__AH_PATH__%s\\n" "$PATH"'],
+        out = subprocess.run([shell, "-ilc", "echo __AH_BEGIN__; env"],
                              capture_output=True, text=True, timeout=20,
                              stdin=subprocess.DEVNULL).stdout
     except (OSError, subprocess.TimeoutExpired):
         out = ""
-    found = re.findall(r"__AH_PATH__(.*)", out)
-    parts = (found[-1].split(":") if found else []) + os.environ.get("PATH", "").split(":")
+    login: Dict[str, str] = {}
+    for line in out.split("__AH_BEGIN__")[-1].splitlines():
+        key, sep, val = line.partition("=")
+        if sep and key in ("PATH", *CONFIG_VARS):
+            login[key] = val
+    LOGIN_ENV.update({k: v for k, v in login.items() if k != "PATH"})
+    parts = login.get("PATH", "").split(":") + os.environ.get("PATH", "").split(":")
     parts += ["/opt/homebrew/bin", "/usr/local/bin", str(HOME / ".local/bin")]
     seen: List[str] = []
     for p in parts:
@@ -181,6 +191,9 @@ class Adapter:
     kind = ""
     binary = ""
     exit_text = "/exit"
+    # Where the agent keeps sessions: $<config_var> if set, else ~/<default_root>.
+    config_var: Optional[str] = None
+    default_root = ""
     # First-run "do you trust this folder?" screen, and the option that says yes.
     trust_marker: Optional[str] = None
     trust_yes: Optional[str] = None
@@ -188,56 +201,85 @@ class Adapter:
     # asking to trust the hook `herdr integration install` just added.
     user_screens: Dict[str, str] = {}
 
+    def config_root(self, env: Dict[str, str]) -> Path:
+        custom = env.get(self.config_var) if self.config_var else None
+        return Path(custom).expanduser() if custom else HOME / self.default_root
+
+    def source_roots(self) -> List[Path]:
+        """Where to look on this machine: the configured root, then the default."""
+        roots = [self.config_root({k: os.environ.get(k, "") for k in CONFIG_VARS}),
+                 HOME / self.default_root]
+        return [r for i, r in enumerate(roots) if r not in roots[:i]]
+
     def locate(self, handle: dict, src_cwd: str) -> Tuple[Path, List[Path]]:
-        """(primary transcript, extra files/dirs). All must live under $HOME."""
+        """(primary transcript, extra files/dirs to carry with it)."""
         raise NotImplementedError
 
     def guess_handle(self, src_cwd: str, started_at: float) -> Optional[dict]:
         """Find the session when herdr didn't record one. None if it can't."""
         return None
 
-    def place(self, primary: Path, src_cwd: str, dst_cwd: str, dst_home: str
+    def place(self, primary: Path, dst_cwd: str, dst_home: str, dst_root: str
               ) -> Tuple[Dict[str, str], List[Tuple[str, str]], str]:
-        """({src path rel to home: dst path rel to home}, extra rewrites, dst handle)."""
+        """({src abs path: dst abs path}, extra rewrites, dst handle)."""
         raise NotImplementedError
 
     def resume_args(self, dst_handle: str) -> List[str]:
         raise NotImplementedError
 
 
+def newest_since(files, started_at: float) -> Optional[Path]:
+    hits = [(f.stat().st_mtime, f) for f in files if f.stat().st_mtime >= started_at]
+    return max(hits)[1] if hits else None
+
+
 class Claude(Adapter):
     kind = binary = "claude"
+    config_var, default_root = "CLAUDE_CONFIG_DIR", ".claude"
     trust_marker = r"trust this folder"
     trust_yes = r"Yes, I trust"
 
     def locate(self, handle, src_cwd):
         sid = handle["value"] if handle["kind"] == "id" else Path(handle["value"]).stem
-        projects = HOME / ".claude" / "projects"
-        preferred = projects / claude_project_dir(src_cwd) / f"{sid}.jsonl"
-        hits = [preferred] if preferred.exists() else sorted(projects.glob(f"*/{sid}.jsonl"))
-        if not hits:
-            raise HandoffError(f"no Claude transcript for session {sid} under {projects}")
-        primary = hits[0]
-        extras = [p for p in (primary.with_suffix(""), HOME / ".claude" / "file-history" / sid)
-                  if p.exists()]
-        return primary, extras
+        for root in self.source_roots():
+            preferred = root / "projects" / claude_project_dir(src_cwd) / f"{sid}.jsonl"
+            hits = [preferred] if preferred.exists() else sorted(root.glob(f"projects/*/{sid}.jsonl"))
+            if hits:
+                primary = hits[0]
+                extras = [p for p in (primary.with_suffix(""), root / "file-history" / sid) if p.exists()]
+                return primary, extras
+        raise HandoffError(f"no Claude transcript for session {sid} under "
+                           f"{', '.join(str(r) for r in self.source_roots())}")
 
-    def place(self, primary, src_cwd, dst_cwd, dst_home):
-        sid = primary.stem
+    def guess_handle(self, src_cwd, started_at):
+        # Without herdr's claude integration: the newest transcript for this cwd
+        # written since the agent started.
+        for root in self.source_roots():
+            f = newest_since((root / "projects" / claude_project_dir(src_cwd)).glob("*.jsonl"), started_at)
+            if f:
+                return {"kind": "id", "value": f.stem}
+        return None
+
+    def place(self, primary, dst_cwd, dst_home, dst_root):
+        sid, src_root = primary.stem, primary.parents[2]
         src_proj, dst_proj = primary.parent.name, claude_project_dir(dst_cwd)
-        mapping = {}
-        for rel in (f".claude/projects/{src_proj}/{sid}.jsonl", f".claude/projects/{src_proj}/{sid}"):
-            mapping[rel] = rel.replace(f"/{src_proj}/", f"/{dst_proj}/")
-        mapping[f".claude/file-history/{sid}"] = f".claude/file-history/{sid}"
-        return mapping, [(f"projects/{src_proj}/", f"projects/{dst_proj}/")], sid
+        mapping = {str(primary): f"{dst_root}/projects/{dst_proj}/{sid}.jsonl",
+                   str(primary.with_suffix("")): f"{dst_root}/projects/{dst_proj}/{sid}",
+                   str(src_root / "file-history" / sid): f"{dst_root}/file-history/{sid}"}
+        return mapping, [(f"{src_root}/", f"{dst_root}/"),
+                         (f"projects/{src_proj}/", f"projects/{dst_proj}/")], sid
 
     def resume_args(self, dst_handle):
         return ["--resume", dst_handle]
 
 
+CODEX_ID = r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+
+
 class Codex(Adapter):
     kind = binary = "codex"
     exit_text = "/quit"
+    config_var, default_root = "CODEX_HOME", ".codex"
     trust_marker = r"Trust this folder\?"
     trust_yes = r"Trust and continue"
     user_screens = {"hook_review": r"Hooks need review"}
@@ -246,41 +288,48 @@ class Codex(Adapter):
         if handle["kind"] == "path":
             return Path(handle["value"]), []
         sid = handle["value"]
-        for sub in ("sessions", "archived_sessions"):
-            hits = sorted((HOME / ".codex" / sub).glob(f"**/rollout-*{sid}.jsonl"))
-            if hits:
-                return hits[-1], []
-        raise HandoffError(f"no Codex rollout for session {sid} under ~/.codex/sessions")
+        for root in self.source_roots():
+            for sub in ("sessions", "archived_sessions"):
+                hits = sorted((root / sub).glob(f"**/rollout-*{sid}.jsonl"))
+                if hits:
+                    return hits[-1], []
+        raise HandoffError(f"no Codex rollout for session {sid} under "
+                           f"{', '.join(str(r) for r in self.source_roots())}")
 
     def guess_handle(self, src_cwd, started_at):
         # herdr's codex integration doesn't report the thread id, and codex writes
         # through a shared daemon, so match the newest rollout for this cwd that
         # was written after the agent process started.
         best = None
-        for f in (HOME / ".codex" / "sessions").glob("**/rollout-*.jsonl"):
-            mtime = f.stat().st_mtime
-            if mtime < started_at or (best and mtime <= best[0]):
-                continue
-            with open(f) as fh:
-                meta = json.loads(fh.readline() or "{}")
-            if meta.get("type") == "session_meta" and meta["payload"].get("cwd") == src_cwd:
-                best = (mtime, f)
+        for root in self.source_roots():
+            for f in (root / "sessions").glob("**/rollout-*.jsonl"):
+                mtime = f.stat().st_mtime
+                if mtime < started_at or (best and mtime <= best[0]):
+                    continue
+                with open(f) as fh:
+                    meta = json.loads(fh.readline() or "{}")
+                if meta.get("type") == "session_meta" and meta["payload"].get("cwd") == src_cwd:
+                    best = (mtime, f)
         return {"kind": "path", "value": str(best[1])} if best else None
 
-    def place(self, primary, src_cwd, dst_cwd, dst_home):
-        rel = str(primary.relative_to(HOME))
-        sid = re.search(r"([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$", primary.name)
+    def place(self, primary, dst_cwd, dst_home, dst_root):
+        sid = re.search(CODEX_ID + r"\.jsonl$", primary.name)
         if not sid:
             raise HandoffError(f"can't read a session id from {primary.name}")
-        return {rel: rel}, [], sid.group(1)
+        parts = primary.parts
+        sub = max(i for i, part in enumerate(parts) if part in ("sessions", "archived_sessions"))
+        src_root = str(Path(*parts[:sub]))
+        return ({str(primary): str(Path(dst_root, *parts[sub:]))},
+                [(f"{src_root}/", f"{dst_root}/")], sid.group(1))
 
     def resume_args(self, dst_handle):
-        m = re.search(r"([0-9a-f]{8}-[0-9a-f-]{27})(?:\.jsonl)?$", dst_handle)
+        m = re.search(CODEX_ID + r"(?:\.jsonl)?$", dst_handle)
         return ["resume", m.group(1) if m else dst_handle]
 
 
 class Omp(Adapter):
     kind = binary = "omp"
+    default_root = ".omp/agent"
 
     def locate(self, handle, src_cwd):
         if handle["kind"] != "path":
@@ -291,13 +340,13 @@ class Omp(Adapter):
         sibling = primary.with_suffix("")
         return primary, [sibling] if sibling.exists() else []
 
-    def place(self, primary, src_cwd, dst_cwd, dst_home):
+    def place(self, primary, dst_cwd, dst_home, dst_root):
         src_dir, dst_dir = primary.parent.name, omp_session_dir(dst_cwd, dst_home)
-        base = f".omp/agent/sessions"
-        mapping = {f"{base}/{src_dir}/{primary.name}": f"{base}/{dst_dir}/{primary.name}",
-                   f"{base}/{src_dir}/{primary.stem}": f"{base}/{dst_dir}/{primary.stem}"}
-        dst_handle = f"{dst_home}/{base}/{dst_dir}/{primary.name}"
-        return mapping, [(f"sessions/{src_dir}/", f"sessions/{dst_dir}/")], dst_handle
+        dst = f"{dst_root}/sessions/{dst_dir}"
+        mapping = {str(primary): f"{dst}/{primary.name}",
+                   str(primary.with_suffix("")): f"{dst}/{primary.stem}"}
+        return mapping, [(f"{primary.parents[2]}/", f"{dst_root}/"),
+                         (f"sessions/{src_dir}/", f"sessions/{dst_dir}/")], f"{dst}/{primary.name}"
 
     def resume_args(self, dst_handle):
         return ["--resume", dst_handle]
@@ -539,6 +588,20 @@ def find_repo(remotes: List[str], branch: Optional[str], override: Optional[str]
 # ---------------------------------------------------------------- remote steps
 
 
+MIN_HERDR = (0, 8, 0)  # oldest version this has been tested with
+
+
+def herdr_version() -> str:
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", run(["herdr", "--version"], check=False))
+    return ".".join(m.groups()) if m else "unknown"
+
+
+def check_herdr_version(where: str, version: str) -> None:
+    if version != "unknown" and tuple(int(x) for x in version.split(".")) < MIN_HERDR:
+        raise HandoffError(f"herdr {version} on {where} is older than "
+                           f"{'.'.join(map(str, MIN_HERDR))}; run `herdr update` there")
+
+
 def step_probe(p: dict) -> dict:
     missing = [b for b in ("git", "herdr", p["binary"]) if not have(b)]
     if missing:
@@ -549,7 +612,10 @@ def step_probe(p: dict) -> dict:
         raise HandoffError(f"herdr server not reachable on target (start herdr there first): {e}")
     repo, others = find_repo(p["remotes"], p["branch"], p.get("dir"))
     return {"home": str(HOME), "repo": repo, "other_checkouts": others,
-            "integration": integration_state(p["kind"])}
+            "integration": integration_state(p["kind"]),
+            "config_root": str(ADAPTERS[p["kind"]].config_root(LOGIN_ENV)),
+            "receive_pack": shutil.which("git-receive-pack", path=LOGIN_PATH),
+            "herdr_version": herdr_version()}
 
 
 def step_prepare(p: dict) -> dict:
@@ -613,11 +679,15 @@ def step_start(p: dict) -> dict:
     start_agent(name, kind, pane, p["args"])
     adapter = ADAPTERS[kind]
     trust = answer_trust(pane, adapter, p.get("trust", True))
-    waiting = []
-    if adapter.user_screens:
-        time.sleep(1)
-        screen = run(["herdr", "pane", "read", pane, "--source", "visible", "--lines", "80"])
-        waiting = [k for k, rx in adapter.user_screens.items() if re.search(rx, screen)]
+    time.sleep(1)
+    screen = run(["herdr", "pane", "read", pane, "--source", "visible", "--lines", "80"])
+    waiting = [k for k, rx in adapter.user_screens.items() if re.search(rx, screen)]
+    status = next((a["agent_status"] for a in herdr("agent", "list")["agents"] if a["pane_id"] == pane), None)
+    if status is None:  # it started, then exited (bad flag, auth, daemon error, ...)
+        tail = "\n".join(l for l in screen.splitlines() if l.strip())[-1200:]
+        raise HandoffError(f"{kind} exited right after starting on the target; its last output:\n{tail}")
+    if status == "blocked" and not waiting:
+        waiting = ["unrecognized_prompt"]  # e.g. a screen whose wording changed in a new agent version
     return {"name": name, "pane_id": pane, "workspace_id": ws["workspace"]["workspace_id"],
             "installed_integration": installed, "trust_prompt": trust,
             "waiting_for_user": waiting}
@@ -669,20 +739,21 @@ def rewrite_tree(src: Path, dst: Path, pairs: List[Tuple[str, str]]) -> None:
 
 
 def send_files(target: str, mapping: Dict[str, str], pairs: List[Tuple[str, str]]) -> List[str]:
+    """Copy {src abs path: dst abs path} to the target, rewriting paths inside."""
     sent = []
     with tempfile.TemporaryDirectory() as stage:
-        for src_rel, dst_rel in mapping.items():
-            src = HOME / src_rel
+        for src_abs, dst_abs in mapping.items():
+            src, rel = Path(src_abs), dst_abs.lstrip("/")
             if src.exists():
                 # file-history holds backups of the user's own files: copy them verbatim
-                rewrite_tree(src, Path(stage) / dst_rel, [] if "file-history" in src_rel else pairs)
-                sent.append(dst_rel)
+                rewrite_tree(src, Path(stage) / rel, [] if "file-history" in src_abs else pairs)
+                sent.append(rel)
         archive = Path(stage).with_suffix(".tgz")
         with tarfile.open(archive, "w:gz") as tar:
             for rel in sent:
                 tar.add(Path(stage) / rel, arcname=rel)
         with open(archive, "rb") as fh:
-            p = subprocess.run(["ssh", "-o", "BatchMode=yes", target, 'tar -C "$HOME" -xzf -'],
+            p = subprocess.run(["ssh", "-o", "BatchMode=yes", target, "tar -C / -xzf -"],
                                stdin=fh, capture_output=True, text=True)
         archive.unlink()
         if p.returncode != 0:
@@ -704,6 +775,17 @@ def cmd_list(_args) -> None:
                      "supported": a["agent"] in ADAPTERS,
                      "this_pane": a["pane_id"] == os.environ.get("HERDR_PANE_ID")})
     print(json.dumps(rows, indent=2))
+
+
+def run_from(host: str, argv: List[str]) -> None:
+    """Run this command on `host` (where the agent lives) instead of here: copy
+    this file there and run it, streaming its output back."""
+    tmp = f"/tmp/agent-handoff-{os.getpid()}.py"
+    remote_cmd = (f"cat > {tmp} && AGENT_HANDOFF_VIA_SSH=1 python3 {tmp} "
+                  f"{shlex.join(argv)}; rc=$?; rm -f {tmp}; exit $rc")
+    with open(__file__, "rb") as fh:
+        rc = subprocess.run(["ssh", "-o", "BatchMode=yes", host, remote_cmd], stdin=fh).returncode
+    sys.exit(rc)
 
 
 def cmd_send(args) -> None:
@@ -748,6 +830,8 @@ def cmd_send(args) -> None:
 
     probe = remote(args.target, "probe", {"remotes": remotes, "branch": branch,
                                           "dir": args.dir, "binary": adapter.binary, "kind": kind})
+    check_herdr_version("this machine", herdr_version())
+    check_herdr_version(args.target, probe["herdr_version"])
     plan = {"agent": agent.get("name") or pane, "kind": kind, "session": handle["value"],
             "transcript": str(primary), "source_repo": src_root, "branch": branch or "(detached)",
             "dirty": is_dirty(src_root), "target": args.target, "target_repo": probe["repo"],
@@ -766,12 +850,14 @@ def cmd_send(args) -> None:
         if wip:
             refspecs.append(f"+{wip}:refs/handoff/{sid8}/wip")
         log(f"pushing {branch or 'HEAD'}{' + uncommitted changes' if wip else ''} to {args.target}")
-        run(["git", "-C", src_root, "push", "-q", "--no-verify",
+        receive = [f"--receive-pack={probe['receive_pack']}"] if probe.get("receive_pack") else []
+        run(["git", "-C", src_root, "push", "-q", "--no-verify", *receive,
              ssh_git_url(args.target, probe["repo"]), *refspecs])
         prep = remote(args.target, "prepare", {"repo": probe["repo"], "sid8": sid8, "branch": branch,
                                                "new_branch": args.new_branch})
         dst_cwd = os.path.normpath(os.path.join(prep["worktree"], rel))
-        mapping, extra_pairs, dst_handle = adapter.place(primary, src_cwd, dst_cwd, probe["home"])
+        mapping, extra_pairs, dst_handle = adapter.place(primary, dst_cwd, probe["home"],
+                                                         probe["config_root"])
         # The repo root as git, the agent and herdr spell it (they differ across
         # symlinks, e.g. macOS /tmp -> /private/tmp); rewrite every spelling.
         roots = {os.path.realpath(src_root), src_root}
@@ -822,6 +908,8 @@ def cmd_send(args) -> None:
 
 def cmd_doctor(args) -> None:
     report = {"version": VERSION, "herdr_env": os.environ.get("HERDR_ENV") == "1",
+              "herdr_version": herdr_version() if have("herdr") else None,
+              "config_roots": {k: [str(r) for r in a.source_roots()] for k, a in ADAPTERS.items()},
               "tools": {b: have(b) for b in ("git", "herdr", "ssh", *ADAPTERS)},
               "integrations": {k: integration_state(k) for k in ADAPTERS}}
     if args.target:
@@ -834,6 +922,9 @@ def cmd_doctor(args) -> None:
 
 def step_doctor(_p: dict) -> dict:
     return {"home": str(HOME), "python": sys.version.split()[0],
+            "herdr_version": herdr_version() if have("herdr") else None,
+            "git_receive_pack": shutil.which("git-receive-pack", path=LOGIN_PATH),
+            "config_roots": {k: str(a.config_root(LOGIN_ENV)) for k, a in ADAPTERS.items()},
             "tools": {b: have(b) for b in ("git", "herdr", *ADAPTERS)},
             "herdr_server": ok(["herdr", "workspace", "list"]),
             "integrations": {k: integration_state(k) for k in ADAPTERS}
@@ -869,8 +960,26 @@ def main() -> None:
     s.add_argument("--no-trust", action="store_true",
                    help="leave the agent's 'trust this folder?' prompt on the target for the user")
     s.add_argument("--dry-run", action="store_true", help="show the plan without changing anything")
-    s.add_argument("agent_args", nargs="*", help="extra agent CLI args, after --")
-    args = ap.parse_args()
+    for sp in (sub.choices["list"], d, s):
+        sp.add_argument("--from", dest="from_host", metavar="HOST",
+                        help="run on HOST (where the agent is) over ssh, e.g. to bring a session back")
+    s.epilog = "Arguments after -- are passed to the agent on the target, e.g. -- --model opus"
+    argv = sys.argv[1:]
+    extra = argv[argv.index("--") + 1:] if "--" in argv else []
+    args = ap.parse_args(argv[:argv.index("--")] if "--" in argv else argv)
+    args.agent_args = extra
+    if args.from_host:
+        rest, skip = [], 0
+        for a in argv:  # drop --from HOST / --from=HOST, keep everything else
+            if skip:
+                skip -= 1
+            elif a == "--from":
+                skip = 1
+            elif not a.startswith("--from="):
+                rest.append(a)
+        run_from(args.from_host, rest)
+    if os.environ.get("AGENT_HANDOFF_VIA_SSH"):
+        adopt_login_path()
     try:
         {"list": cmd_list, "send": cmd_send, "doctor": cmd_doctor}[args.cmd](args)
     except HandoffError as e:

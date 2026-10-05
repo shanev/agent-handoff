@@ -2,61 +2,96 @@
 
 Move a running coding-agent session to another machine and keep going there.
 
-You're in a Claude Code (or Codex, or omp) session on your laptop and want it running on the always-on Mac mini instead, or the other way round. `agent-handoff` quits the agent, moves its transcript, branch and uncommitted changes over SSH, and resumes it in [herdr](https://herdr.dev) on the other machine. The repo can be checked out at a different path there: checkouts are matched by git remote.
+Say you're working with Claude Code on your laptop and want the session to keep running on the Mac mini at home, or you're at the mini and want the laptop's session over here. Ask Hermes to hand it off. It quits the agent, moves the conversation, the branch and your uncommitted changes, and resumes the same session in [herdr](https://herdr.dev) on the other machine. The repo can live at a different path there; it's matched by its git remote.
 
-It is packaged as an [agent skill](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills), so you can just tell your agent "hand the hark session off to vega". The script also works on its own.
+Works with **Claude Code**, **Codex** and **omp**.
+
+## Using it in Hermes
+
+Once the skill is installed, just say what you want:
+
+> Hand off my hark Claude session to vega.
+
+> Move the codex agent in modelrelay over to the mini.
+
+> Bring the session that's running on vega back to my laptop.
+
+> What agents could I hand off right now?
+
+> Is vega set up for handoffs?
+
+Hermes finds the agent you mean and checks the other machine. If anything is unclear, it asks: which agent, which machine, or which checkout when there's more than one. Then it moves the session and tells you where it ended up:
+
+> Moved **hark-claude** to vega. It's running in `/Users/vega/github.com/tensor-systems/hark` on `main`, with your two uncommitted files. Attach with `herdr --remote vega@vega`.
+
+Attach from wherever you are and carry on. The agent remembers the whole conversation. To bring it back, ask again, from either machine.
+
+A few things you might notice afterwards:
+
+- **Your laptop's checkout is clean.** The uncommitted changes went with the session, and the local copy is stashed. `git stash list` shows it, labelled `agent-handoff`.
+- **The agent may ask about trust on the other machine.** If it asks to trust the folder, the handoff answers yes, since you were already working in that repo. Pass `--no-trust` if you'd rather answer it yourself. Codex may also ask you to approve the herdr hook the handoff installed; that one is always left to you, and Hermes will say so.
+- **The original pane stays open** at a shell prompt.
 
 ## Install
 
-As a Hermes skill:
+On every machine you want to hand sessions **from** (usually all of them):
 
 ```bash
 hermes skills install shanev/agent-handoff/skills/agent-handoff
 ```
 
-Install it on every machine you want to hand off *from*. The target only needs `python3`, `git`, `herdr` (with its server running) and the agent's CLI. The script sends itself over SSH for the steps that run there.
-
-## Use
-
-```bash
-S=~/.hermes/skills/agent-handoff/scripts/agent_handoff.py   # or wherever it's installed
-python3 $S list                          # agents in this herdr session
-python3 $S doctor vega@vega              # check both machines
-python3 $S send hark-claude vega@vega --dry-run
-python3 $S send hark-claude vega@vega
-herdr --remote vega@vega                 # attach and carry on
-```
-
-To hand it back, run the same thing on the other machine with this one as the target.
-
-## What a handoff does
-
-1. Reads the agent's session id from herdr. The target must run herdr; if it lacks the agent integration, the handoff installs it so the session can come back.
-2. Finds the same repo on the target by git remote, at whatever path it lives.
-3. Quits the agent with `/exit` so the transcript is final.
-4. Pushes `HEAD` and a snapshot of uncommitted and untracked changes **directly to the target over SSH**, as temporary `refs/handoff/*` refs. Nothing goes to GitHub, and no branch is force-updated.
-5. On the target, fast-forwards the branch where it's checked out, or creates a worktree at `<repo>.worktrees/<branch>`, then applies the changes.
-6. Copies the transcript into the target agent's session store, replacing old repo and home paths with the new ones.
-7. Opens a herdr workspace on the target and resumes the agent there.
-8. Stashes the changes in the source checkout, so handing back applies cleanly.
-
-If something fails after the agent has quit, it is restarted where it was.
-
-## Supported agents
-
-| Agent | Transcript | Resume |
-|---|---|---|
-| Claude Code | `~/.claude/projects/<cwd>/<id>.jsonl` (+ subagent and file-history dirs) | `claude --resume <id>` |
-| Codex | `~/.codex/sessions/YYYY/MM/DD/rollout-…-<id>.jsonl` | `codex resume <id>` |
-| omp | `~/.omp/agent/sessions/<cwd>/…jsonl` | `omp --resume <path>` |
-
-Each agent is a small adapter class in [`agent_handoff.py`](skills/agent-handoff/scripts/agent_handoff.py) with three methods: where the transcript is, where it goes on the target, and how to resume it. PRs for more agents are welcome.
+Then ask Hermes "is `<machine>` set up for agent handoffs?" to check each machine you'll hand sessions **to**.
 
 ## Requirements
 
-- macOS or Linux, `python3` ≥ 3.9 (stdlib only), `git`, `ssh`, `tar`.
-- herdr on both machines, with the agent integration installed on the source (`herdr integration install claude`).
-- Non-interactive SSH between the machines, e.g. over [Tailscale](https://tailscale.com).
+On both machines:
+
+- [herdr](https://herdr.dev) 0.8.0 or newer, with its server running, and the agents running inside herdr panes.
+- `python3` 3.9 or newer, plus `git`, `ssh` and `tar`. Stock macOS has all of these.
+- The agent's CLI (`claude`, `codex` or `omp`), installed and logged in.
+- A clone of the repo, with a git remote so it can be matched.
+
+Between them:
+
+- SSH that works without prompts, in both directions if you want to hand sessions back. Check with `ssh -o BatchMode=yes <host> true`. Tailscale works well for this.
+
+On the machine you hand off from, install herdr's integration for your agent (`herdr integration install claude`, and so on) so herdr records session ids. It isn't strictly needed: without it, the handoff falls back to the agent's newest transcript for that folder. On the receiving machine, the handoff installs the integration itself if it's missing.
+
+## What a handoff does
+
+1. Finds the agent and its session in herdr.
+2. Finds the same repo on the other machine by git remote. It searches `~/github.com`, `~/src`, `~/code`, `~/dev`, `~/Developer`, `~/projects`, `~/repos`, `~/work`, `~/git`, `~/workspace` and the top of `~`. To change that, set `AGENT_HANDOFF_ROOTS=dir1:dir2` on that machine.
+3. Quits the agent so its transcript is final.
+4. Sends your commits and a snapshot of uncommitted and untracked files **directly to the other machine over SSH**. Nothing is pushed to GitHub, and no branch is force-updated.
+5. Fast-forwards the branch where it's checked out on the other machine, or creates a worktree at `<repo>.worktrees/<branch>`, then applies your changes.
+6. Copies the transcript into the agent's session folder there (honouring `CLAUDE_CONFIG_DIR` and `CODEX_HOME`) and rewrites the old paths inside it.
+7. Opens a herdr workspace there and resumes the session.
+8. Stashes the changes on the machine it left.
+
+If anything goes wrong once the agent has quit, including the agent failing to start on the other side, the agent is restarted where it was and you're told why.
+
+## Running it without Hermes
+
+The skill is a single script, so any agent that loads skills can use it, or you can run it yourself:
+
+```bash
+S=~/.hermes/skills/autonomous-ai-agents/agent-handoff/scripts/agent_handoff.py
+python3 $S list                                  # agents here
+python3 $S doctor vega@vega                      # check both machines
+python3 $S send hark-claude vega@vega --dry-run  # show the plan
+python3 $S send hark-claude vega@vega            # do it
+python3 $S send hark-claude laptop@laptop --from vega@vega   # bring one back from vega
+```
+
+Run `python3 $S send --help` for every option.
+
+## Tested on
+
+macOS (Apple silicon), zsh/bash/sh, herdr 0.8.0 and 0.9.3, Claude Code 2.1, Codex 0.160 and omp, between a MacBook and a Mac mini over Tailscale. Linux should work, since nothing in it is macOS-specific, but it hasn't been tried yet. Reports welcome.
+
+## Adding an agent
+
+Each agent is a small adapter class in [`agent_handoff.py`](skills/agent-handoff/scripts/agent_handoff.py). It says where the transcript lives, where it goes on the other machine, how to resume it, and what its "trust this folder?" screen looks like. PRs for more agents are welcome.
 
 ## License
 

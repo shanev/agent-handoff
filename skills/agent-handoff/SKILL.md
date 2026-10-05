@@ -1,7 +1,7 @@
 ---
 name: agent-handoff
 description: "Move a running coding-agent session (Claude Code, Codex, omp) from one machine to another over SSH, with its transcript, branch and uncommitted changes, and resume it in herdr on the target. Use when the user asks to hand off, move, transfer, or continue an agent session on another machine/host (e.g. 'move the hark claude to vega'). Requires herdr on both machines."
-version: 0.1.0
+version: 0.2.0
 author: Shane Vitarana
 license: MIT
 platforms: [macos, linux]
@@ -17,20 +17,20 @@ Moves a coding agent that is running in a herdr pane on this machine to another 
 
 One handoff does all of this:
 
-1. Finds the agent in herdr and reads its session id (herdr's agent integration records it).
+1. Finds the agent in herdr and its session: herdr's agent integration records the id. Without it, the script uses the newest transcript for that folder written since the agent started.
 2. Checks the target over ssh: tools present, herdr server up, and **a checkout of the same repo** — matched by git remote, so it may live at a different path.
 3. Quits the agent cleanly (`/exit`), so nothing else writes to the transcript.
 4. Pushes `HEAD` plus a snapshot of uncommitted changes **straight to the target over ssh** (`refs/handoff/*`, removed afterwards). Nothing is pushed to GitHub, and no branch on either side is rewritten.
 5. On the target: fast-forwards the branch where it is already checked out, or else makes a worktree next to the repo (`<repo>.worktrees/<branch>`), then applies the uncommitted changes.
-6. Copies the transcript into the target agent's session store, replacing the old repo path and home directory with the new ones inside it.
+6. Copies the transcript into the target agent's session store (honouring `CLAUDE_CONFIG_DIR` / `CODEX_HOME` on either side), replacing the old repo path, home directory and config folder with the new ones inside it.
 7. Installs the herdr integration for that agent on the target if it's missing (so the next handoff back knows the session id), opens a herdr workspace there and resumes the agent. If the agent asks whether to trust the folder, the script answers yes: the user was already working in this repo on the source. Pass `--no-trust` to leave that question for the user.
 8. Stashes the uncommitted changes in the source checkout (`git stash list` shows them), so a later handoff back applies cleanly.
 
-If anything fails after step 3, the script restarts the agent where it was.
+If anything fails after step 3, including the agent exiting straight after it starts on the target, the script restarts the agent where it was and reports why.
 
 ## How to run it
 
-The script is `scripts/agent_handoff.py` in this skill's directory (Hermes reports it as `skill_dir`). It needs only `python3`.
+The script is `scripts/agent_handoff.py` in the folder that contains this SKILL.md (Hermes reports it as `skill_dir`). It needs only `python3`.
 
 ```bash
 S="<skill_dir>/scripts/agent_handoff.py"
@@ -38,6 +38,8 @@ python3 "$S" list                         # agents here, their status and sessio
 python3 "$S" doctor <ssh-target>          # prerequisites here and on the target
 python3 "$S" send <agent> <ssh-target> --dry-run
 python3 "$S" send <agent> <ssh-target>
+python3 "$S" list --from <host>           # agents on another machine
+python3 "$S" send <agent> <ssh-target> --from <host>   # hand off an agent that runs on <host>
 ```
 
 - `<agent>`: a herdr agent name, pane id (e.g. `w1Y:p7`), or session id prefix, taken from `list`.
@@ -47,8 +49,12 @@ Every command prints JSON. `send` ends with `"ok": true` and an `attach` command
 
 ## Procedure
 
+The handoff always runs on the machine where the agent is. If the user wants a session moved *from* another machine (for example "bring the hark session on vega back here"), add `--from <that machine>` to `list` and `send`. The target is then this machine's ssh name. If you don't know it, ask the user, because the other machine must be able to reach it.
+
+If this is the first handoff to a machine, run `doctor <ssh-target>` first. Report anything missing (herdr not running, the agent CLI not installed, ssh failing), with the fix.
+
 1. Run `list`. Pick the agent the user means: match on name, repo (`cwd`) or what it is working on. If more than one fits, ask. Never pick a row with `"this_pane": true`; that is you.
-2. If the user didn't name the target machine, ask for it. Don't guess.
+2. If the user didn't name the target machine, ask for it. Don't guess. Users often say a nickname ("the mini", "my laptop"). If it doesn't match a name the user has given before, ask which ssh host it means.
 3. Run `send … --dry-run` and check the plan:
    - `target_repo` is the checkout you expected. If `other_target_checkouts` lists others and it's not obvious, ask, then pass `--dir <path>`.
    - `source_argv` shows how the agent was started. If it had flags the user will want kept (model, permission mode), pass them after `--`, e.g. `send hark vega@vega -- --model opus`.
@@ -56,6 +62,8 @@ Every command prints JSON. `send` ends with `"ok": true` and an `attach` command
 5. Run `send`. Report the target worktree, branch, whether uncommitted changes moved, and the `attach` line (`herdr --remote <target>`).
 6. If `target_waiting_for_user` is not empty, the agent on the target is showing a screen the user must answer, and the script never answers these. Tell the user what it is, and don't send the agent prompts until they've dealt with it (a prompt's Enter would land on that screen):
    - `hook_review`: Codex wants approval for a new or changed hook, usually the herdr hook the handoff just installed. Approving it lets herdr track Codex's state on that machine. Escape skips it, and hooks then don't run.
+   - `unrecognized_prompt`: the agent stopped on a screen this tool doesn't know (often after an agent update reworded one). The user should attach and look.
+7. If `send` fails, quote its `error`. It ends with what to do (`--new-branch`, `--dir`, install something, wait for the agent).
 
 ## Options
 
@@ -68,6 +76,8 @@ Every command prints JSON. `send` ends with `"ok": true` and an `attach` command
 | `--session ID_OR_PATH` | Session to move, if herdr didn't record one (integration installed after the agent started). |
 | `--no-focus` | Don't focus the new workspace on the target. |
 | `--wait` | Wait for a `working` agent to go idle first. |
+| `--no-trust` | Don't answer the agent's "trust this folder?" screen on the target; leave it for the user. |
+| `--from HOST` | Run on HOST, where the agent is, over ssh. Works with `list`, `doctor` and `send`. |
 
 ## Repo discovery on the target
 
@@ -80,4 +90,5 @@ Checkouts are matched by any git remote (`git@github.com:o/r.git` and `https://g
 - The agent must be at rest (idle or done), not mid-turn or waiting on an approval.
 - herdr's Codex integration doesn't record a session id. The script picks the newest Codex transcript for the agent's folder written since the agent started. If two Codex agents share a folder it stops and asks for `--session`.
 - Uncommitted changes leave the source checkout (they're stashed). Don't hand off an agent in a repo where you are editing files by hand at the same time.
+- Needs herdr 0.8.0 or newer on both machines, and ssh between them that works without prompts (`ssh -o BatchMode=yes <host> true`).
 - The source pane is left at a shell prompt. Worktrees the handoff creates are left in place; remove them with `git worktree remove` when you're done.
