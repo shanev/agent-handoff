@@ -362,7 +362,7 @@ def start_agent(name: str, kind: str, pane: str, args: List[str]) -> dict:
             if occupant and occupant["agent"] == kind:
                 return {"agent": occupant}
             last = e
-            if "prompt" not in str(e) and "not available" not in str(e):
+            if not re.search(r"agent_pane_busy|available|prompt", str(e)):
                 raise
             time.sleep(1)
     raise last  # type: ignore[misc]
@@ -753,9 +753,13 @@ def cmd_send(args) -> None:
                                                "new_branch": args.new_branch})
         dst_cwd = os.path.normpath(os.path.join(prep["worktree"], rel))
         mapping, extra_pairs, dst_handle = adapter.place(primary, src_cwd, dst_cwd, probe["home"])
-        pairs = [(os.path.realpath(src_root), prep["worktree"])]
-        if os.path.realpath(src_root) != src_root:
-            pairs.append((src_root, prep["worktree"]))
+        # The repo root as git, the agent and herdr spell it (they differ across
+        # symlinks, e.g. macOS /tmp -> /private/tmp); rewrite every spelling.
+        roots = {os.path.realpath(src_root), src_root}
+        for cwd in (src_cwd, agent["cwd"]):
+            roots.add(cwd if rel == "." else cwd[: -len(rel) - 1])
+        roots |= {r[len("/private"):] for r in roots if re.match(r"^/private/(tmp|var|etc)/", r)}
+        pairs = [(r, prep["worktree"]) for r in sorted(roots, key=len, reverse=True)]
         pairs += extra_pairs + [(str(HOME) + "/", probe["home"].rstrip("/") + "/")]
         sent = send_files(args.target, mapping, [(a, b) for a, b in pairs if a != b])
         log(f"copied {len(sent)} session file(s)")

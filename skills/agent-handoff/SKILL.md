@@ -23,7 +23,7 @@ One handoff does all of this:
 4. Pushes `HEAD` plus a snapshot of uncommitted changes **straight to the target over ssh** (`refs/handoff/*`, removed afterwards). Nothing is pushed to GitHub, and no branch on either side is rewritten.
 5. On the target: fast-forwards the branch where it is already checked out, or else makes a worktree next to the repo (`<repo>.worktrees/<branch>`), then applies the uncommitted changes.
 6. Copies the transcript into the target agent's session store, replacing the old repo path and home directory with the new ones inside it.
-7. Installs the herdr integration for that agent on the target if it's missing (so the next handoff back knows the session id), opens a herdr workspace there and resumes the agent.
+7. Installs the herdr integration for that agent on the target if it's missing (so the next handoff back knows the session id), opens a herdr workspace there and resumes the agent. If the agent asks whether to trust the folder, the script answers yes: the user was already working in this repo on the source. Pass `--no-trust` to leave that question for the user.
 8. Stashes the uncommitted changes in the source checkout (`git stash list` shows them), so a later handoff back applies cleanly.
 
 If anything fails after step 3, the script restarts the agent where it was.
@@ -54,6 +54,8 @@ Every command prints JSON. `send` ends with `"ok": true` and an `attach` command
    - `source_argv` shows how the agent was started. If it had flags the user will want kept (model, permission mode), pass them after `--`, e.g. `send hark vega@vega -- --model opus`.
 4. If the agent is `working`, tell the user, and only pass `--wait` if they want to wait for it to finish its turn.
 5. Run `send`. Report the target worktree, branch, whether uncommitted changes moved, and the `attach` line (`herdr --remote <target>`).
+6. If `target_waiting_for_user` is not empty, the agent on the target is showing a screen the user must answer, and the script never answers these. Tell the user what it is, and don't send the agent prompts until they've dealt with it (a prompt's Enter would land on that screen):
+   - `hook_review`: Codex wants approval for a new or changed hook, usually the herdr hook the handoff just installed. Approving it lets herdr track Codex's state on that machine. Escape skips it, and hooks then don't run.
 
 ## Options
 
@@ -76,4 +78,6 @@ Checkouts are matched by any git remote (`git@github.com:o/r.git` and `https://g
 - Supported agents: `claude`, `codex`, `omp`. Others (including `hermes`) fail with a clear error. Adding one means adding an adapter class to the script.
 - The repo must have at least one git remote, so it can be matched on the target.
 - The agent must be at rest (idle or done), not mid-turn or waiting on an approval.
+- herdr's Codex integration doesn't record a session id. The script picks the newest Codex transcript for the agent's folder written since the agent started. If two Codex agents share a folder it stops and asks for `--session`.
+- Uncommitted changes leave the source checkout (they're stashed). Don't hand off an agent in a repo where you are editing files by hand at the same time.
 - The source pane is left at a shell prompt. Worktrees the handoff creates are left in place; remove them with `git worktree remove` when you're done.
