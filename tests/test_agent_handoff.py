@@ -513,8 +513,13 @@ class CommandLine(unittest.TestCase):
         seen = {}
         with mock.patch.object(sys, "argv", ["agent_handoff.py", *argv]), \
              mock.patch.object(ah, "cmd_send", side_effect=lambda a: seen.setdefault("args", a)), \
-             mock.patch.object(ah, "run_from", side_effect=lambda h, rest: seen.update(host=h, rest=rest)):
-            ah.main()
+             mock.patch.object(ah, "run_from", side_effect=lambda h, rest: seen.update(host=h, rest=rest)
+                               or sys.exit(0)):
+            try:
+                ah.main()
+            except SystemExit as e:
+                if e.code not in (0, None) or "host" not in seen:
+                    raise
         return seen
 
     def test_agent_args_after_double_dash_with_options_first(self):
@@ -562,16 +567,14 @@ class CommandLine(unittest.TestCase):
         self.assertIn("never changes ssh keys", msg)
         self.assertNotIn("..", msg)
 
-    def test_network_sandbox_is_named_before_any_ssh(self):
-        out = io.StringIO()
-        with mock.patch.dict(os.environ, {"CODEX_SANDBOX_NETWORK_DISABLED": "1"}), \
-             mock.patch.object(sys, "argv", ["agent_handoff.py", "list", "--from", "vega@vega"]), \
-             mock.patch.object(ah, "run_from", side_effect=AssertionError("tried ssh")), \
-             redirect_stdout(out), self.assertRaises(SystemExit):
-            ah.main()
-        self.assertIn("sandbox that blocks network access", json.loads(out.getvalue())["error"])
+    def test_codex_sandbox_is_a_hint_not_a_block(self):
+        # approved commands still inherit the variable, so nothing may refuse to run on it
         with mock.patch.dict(os.environ, {"CODEX_SANDBOX_NETWORK_DISABLED": "1"}):
-            self.assertIn("outside the sandbox", ah.ssh_failure("vega@vega", "Could not resolve hostname vega"))
+            seen = self.main("list", "--from", "vega@vega")
+            self.assertEqual(seen["host"], "vega@vega")
+            msg = ah.ssh_failure("vega@vega", "ssh: Could not resolve hostname vega: -65563\n")
+        self.assertIn("Could not resolve hostname vega", msg)
+        self.assertIn("outside the sandbox", msg)
 
     def test_remote_step_reports_errors_as_json(self):
         buf = io.StringIO()

@@ -26,7 +26,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-VERSION = "0.4.5"
+VERSION = "0.4.6"
 RESULT_MARK = "AGENT_HANDOFF_RESULT:"
 HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "agent-handoff"
@@ -609,19 +609,19 @@ def this_machine() -> str:
 
 
 def network_sandboxed() -> bool:
-    """True when running inside an agent sandbox that blocks network access
-    (Codex sets this), where ssh fails with errors that look like a bad host."""
+    """A hint, not proof: Codex sets this in its sessions, and commands the user
+    approves to run outside the sandbox still inherit it. So it only shapes the
+    message after ssh has actually failed."""
     return os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED") == "1"
-
-
-SANDBOX_HELP = ("This command is running inside a sandbox that blocks network access (Codex's "
-                "default), so ssh can't reach any machine; the host is probably fine. Ask the user "
-                "to approve running it outside the sandbox, then run the same command again.")
 
 
 def ssh_failure(target: str, stderr: str) -> str:
     if network_sandboxed():
-        return f"can't ssh to {target}: {SANDBOX_HELP}"
+        return (f"can't ssh to {target}: {stderr.strip()[-300:].rstrip('.')}. This is probably "
+                f"Codex's sandbox blocking network access, not a problem with {target}: ask the user "
+                f"to approve running this command outside the sandbox, then run it again. If it was "
+                f"already outside the sandbox, the user has to fix ssh to {target}; agent-handoff "
+                f"never changes ssh keys or config.")
     return (f"can't ssh from {socket.gethostname().split('.')[0]} to {target}: {stderr.strip()[-300:].rstrip('.')}. "
             f"agent-handoff needs ssh that works without prompts (`ssh -o BatchMode=yes {target} true`). "
             f"If {target} is the wrong name for that machine, pass the right one; otherwise the user has "
@@ -1188,10 +1188,6 @@ def main() -> None:
         argv = argv[:i + 1] + [args.target] + argv[i + 1:]
     if args.from_host and args.cmd == "send" and args.target == args.from_host:
         ap.error(f"--from and the target are both {args.target}; the target is where the agent should go")
-    needs_ssh = bool(args.from_host) or (args.cmd in ("send", "doctor") and args.target not in (None, LOCAL))
-    if needs_ssh and network_sandboxed():
-        print(json.dumps({"ok": False, "error": SANDBOX_HELP}, indent=2))
-        sys.exit(1)
     if args.from_host:
         rest, skip = [], 0
         for a in argv:  # drop --from HOST / --from=HOST, keep everything else
