@@ -56,12 +56,12 @@ On both machines:
 
 - [herdr](https://herdr.dev) 0.8.0 or newer, with its server running, and the agents running inside herdr panes.
 - `python3` 3.9 or newer, plus `git`, `ssh` and `tar`. Stock macOS has all of these.
-- The agent's CLI (`claude`, `codex`, `omp`, `pi` or `grok`), installed and logged in.
+- The agent's CLI (`claude`, `codex`, `omp`, `pi` or `grok`), installed, logged in, and on the PATH of interactive shells, since herdr starts it in a pane. Installers that put it in `~/.local/bin` don't always add that to the PATH; check `~/.bashrc`. If an agent was never set up or isn't logged in on the other machine, the handoff still copies the session, and Hermes tells you to finish setup there.
 - A clone of the repo, with a git remote so it can be matched.
 
 Between them:
 
-- SSH that works without prompts, in both directions if you want to hand sessions back. Check with `ssh -o BatchMode=yes <host> true`. Tailscale works well for this. To bring a session back, the other machine reaches this one as `you@this-hostname`; if that's not the right name, set `AGENT_HANDOFF_SELF=user@host`. The skill never sets up ssh for you; if it's missing, Hermes tells you what to fix.
+- SSH that works without prompts, in both directions if you want to hand sessions back. Check with `ssh -o BatchMode=yes <host> true`. Tailscale works well for this. Tailscale SSH in *check mode* asks you to re-authenticate in a browser from time to time; until you do, handoffs to that machine fail with an ssh error. To bring a session back, the other machine reaches this one as `you@this-hostname`; if that's not the right name, set `AGENT_HANDOFF_SELF=user@host`. The skill never sets up ssh for you; if it's missing, Hermes tells you what to fix.
 
 On the machine you hand off from, install herdr's integration for your agent (`herdr integration install claude`, and so on) so herdr records session ids. It isn't strictly needed: without it, the handoff falls back to the agent's newest transcript for that folder. On the receiving machine, the handoff installs the integration itself if it's missing.
 
@@ -96,7 +96,11 @@ Run `python3 $S send --help` for every option.
 
 ## Tested on
 
-macOS (Apple silicon), zsh/bash/sh, herdr 0.8.0 and 0.9.3. Claude Code 2.1 and Codex 0.160 between a MacBook and a Mac mini over Tailscale. omp, pi 0.84 and grok 1.0.46 between two checkouts on one Mac, with the ssh steps done locally. Linux should work, since nothing in it is macOS-specific, but it hasn't been tried yet. Reports welcome.
+- **macOS ⇄ macOS:** Claude Code 2.1 and Codex 0.160, between a MacBook and a Mac mini over Tailscale.
+- **macOS ⇄ Linux:** Claude Code, between a MacBook and an Ubuntu 24.04 server (x86_64, root, bash) over Tailscale SSH.
+- **One machine:** omp, pi 0.84 and grok 1.0.46 between two checkouts, plus the `--here` modes.
+
+All of it with herdr 0.8.0 and 0.9.3, and zsh/bash/sh. CI runs the tests on Linux and macOS. Reports from other setups are welcome.
 
 ## Adding an agent
 
