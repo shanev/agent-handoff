@@ -528,10 +528,11 @@ def find_repo(remotes: List[str], branch: Optional[str], override: Optional[str]
         return (not has_branch, -mtime)
 
     matches.sort(key=rank)
-    cache = load_cache()
-    for r in remotes:
-        cache[r] = matches[0]
-    save_cache(cache)
+    if not override:  # remember discoveries, not one-off --dir choices
+        cache = load_cache()
+        for r in remotes:
+            cache[r] = matches[0]
+        save_cache(cache)
     return matches[0], matches[1:]
 
 
@@ -795,7 +796,10 @@ def cmd_send(args) -> None:
             remote(args.target, "cleanup-refs", {"repo": probe["repo"], "sid8": sid8})
         except HandoffError as e:
             log(f"could not clean up refs on target: {e}")
-        start_agent(agent.get("name") or f"{kind}-{sid8}".lower(), kind, pane, src_args)
+        try:
+            start_agent(agent.get("name") or f"{kind}-{sid8}".lower(), kind, pane, src_args)
+        except HandoffError as e:
+            log(f"could not restart it; run `{adapter.binary} {shlex.join(src_args)}` in {pane}: {e}")
         raise
 
     stashed = False
