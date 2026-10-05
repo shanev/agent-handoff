@@ -26,7 +26,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 RESULT_MARK = "AGENT_HANDOFF_RESULT:"
 HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "agent-handoff"
@@ -760,7 +760,8 @@ def step_prepare(p: dict) -> dict:
         else:
             git(repo, "branch", branch, head)
         slug = re.sub(r"[^A-Za-z0-9._-]", "-", branch)
-        path = str(Path(repo).parent / f"{Path(repo).name}.worktrees" / slug)
+        main = Path(wts[0]["worktree"])  # worktrees sit beside the main checkout, never nested
+        path = str(main.parent / f"{main.name}.worktrees" / slug)
         git(repo, "worktree", "add", "-q", path, branch)
         created = True
     if ref_exists(repo, f"refs/remotes/origin/{branch}"):

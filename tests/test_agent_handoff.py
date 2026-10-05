@@ -353,6 +353,15 @@ class GitTransport(TempDirTest):
         self.assertEqual(out["branch"], "handoff/abcd1234-2")
         self.assertTrue(out["created_worktree"])
 
+    def test_worktree_from_a_worktree_goes_beside_the_main_checkout(self):
+        sh("git", "checkout", "-qb", "feature", cwd=self.src)
+        self.handoff_refs()
+        first = self.prepare(branch="feature")
+        self.handoff_refs("efgh5678")
+        second = ah.step_prepare({"repo": first["worktree"], "sid8": "efgh5678", "branch": "feature",
+                                  "new_branch": True})
+        self.assertEqual(Path(second["worktree"]).parent, Path(first["worktree"]).parent)
+
     def test_detached_source_uses_handoff_branch(self):
         sh("git", "checkout", "-q", "--detach", cwd=self.src)
         self.handoff_refs()
