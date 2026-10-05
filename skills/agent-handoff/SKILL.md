@@ -1,7 +1,7 @@
 ---
 name: agent-handoff
 description: "Move a running coding-agent session (Claude Code, Codex, omp, pi, grok) from one machine to another over SSH, with its transcript, branch and uncommitted changes, and resume it in herdr on the target. Use when the user asks to hand off, move, transfer, or continue an agent session on another machine/host (e.g. 'move the hark claude to vega'), or on this machine into another checkout or its own worktree. Requires herdr on both machines."
-version: 0.4.3
+version: 0.4.4
 author: Shane Vitarana
 license: MIT
 platforms: [macos, linux]
@@ -30,7 +30,9 @@ If anything fails after step 3, including the agent exiting straight after it st
 
 ## How to run it
 
-The script is `scripts/agent_handoff.py` in the folder that contains this SKILL.md (Hermes reports it as `skill_dir`). It needs only `python3`.
+The script is `scripts/agent_handoff.py` in the folder that contains this SKILL.md (your agent may call it the skill's base directory). It needs only `python3`.
+
+Run it with a shell that has network access and may run `ssh` and write to other agents' session folders (`~/.claude`, `~/.codex`, ...). If your agent runs commands in a sandbox that blocks these, ask the user to approve running the script outside it; don't work around the sandbox.
 
 ```bash
 S="<skill_dir>/scripts/agent_handoff.py"
