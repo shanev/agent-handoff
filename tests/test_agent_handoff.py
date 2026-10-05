@@ -562,6 +562,17 @@ class CommandLine(unittest.TestCase):
         self.assertIn("never changes ssh keys", msg)
         self.assertNotIn("..", msg)
 
+    def test_network_sandbox_is_named_before_any_ssh(self):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"CODEX_SANDBOX_NETWORK_DISABLED": "1"}), \
+             mock.patch.object(sys, "argv", ["agent_handoff.py", "list", "--from", "vega@vega"]), \
+             mock.patch.object(ah, "run_from", side_effect=AssertionError("tried ssh")), \
+             redirect_stdout(out), self.assertRaises(SystemExit):
+            ah.main()
+        self.assertIn("sandbox that blocks network access", json.loads(out.getvalue())["error"])
+        with mock.patch.dict(os.environ, {"CODEX_SANDBOX_NETWORK_DISABLED": "1"}):
+            self.assertIn("outside the sandbox", ah.ssh_failure("vega@vega", "Could not resolve hostname vega"))
+
     def test_remote_step_reports_errors_as_json(self):
         buf = io.StringIO()
         with mock.patch.object(ah, "adopt_login_path"), redirect_stdout(buf):
