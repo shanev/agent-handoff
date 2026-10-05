@@ -1,7 +1,7 @@
 ---
 name: agent-handoff
-description: "Move a running coding-agent session (Claude Code, Codex, omp, pi, grok) from one machine to another over SSH, with its transcript, branch and uncommitted changes, and resume it in herdr on the target. Use when the user asks to hand off, move, transfer, or continue an agent session on another machine/host (e.g. 'move the hark claude to vega'). Requires herdr on both machines."
-version: 0.3.0
+description: "Move a running coding-agent session (Claude Code, Codex, omp, pi, grok) from one machine to another over SSH, with its transcript, branch and uncommitted changes, and resume it in herdr on the target. Use when the user asks to hand off, move, transfer, or continue an agent session on another machine/host (e.g. 'move the hark claude to vega'), or on this machine into another checkout or its own worktree. Requires herdr on both machines."
+version: 0.4.0
 author: Shane Vitarana
 license: MIT
 platforms: [macos, linux]
@@ -40,6 +40,8 @@ python3 "$S" send <agent> <ssh-target> --dry-run
 python3 "$S" send <agent> <ssh-target>
 python3 "$S" list --from <host>           # agents on another machine
 python3 "$S" send <agent> --from <host>   # bring an agent on <host> back to this machine
+python3 "$S" send <agent> --here --new-worktree   # same machine: into a new worktree of the repo
+python3 "$S" send <agent> --here --dir <checkout> # same machine: into another checkout
 ```
 
 - `<agent>`: a herdr agent name, pane id (e.g. `w1Y:p7`), or session id prefix, taken from `list`.
@@ -50,6 +52,8 @@ Every command prints JSON. `send` ends with `"ok": true` and an `attach` command
 ## Procedure
 
 The handoff always runs on the machine where the agent is. To bring a session *back* from another machine (for example "bring the hark session on vega back here"), use `list --from <that machine>`, then `send <agent> --from <that machine>` with **no target**. The script fills in this machine's ssh name (`$AGENT_HANDOFF_SELF`, else `user@hostname`). Only pass a target with `--from` if the user names a third machine. Never pass the `--from` host as the target.
+
+To move a session **on this machine**, use `--here` (no ssh). Use `--here --new-worktree` when the user wants the session in its own worktree (it gets a `handoff/<id>` branch), and `--here --dir <path>` for a checkout they name. Plain `--here` uses another checkout of the repo on this machine if there is one, else a new worktree; the dry run shows which (`target_repo`).
 
 If this is the first handoff to a machine, run `doctor <ssh-target>` first. Report anything missing (herdr not running, the agent CLI not installed, ssh failing), with the fix.
 
@@ -88,6 +92,8 @@ Running `doctor` to diagnose is fine. Retrying with a corrected name the user ga
 | `--no-focus` | Don't focus the new workspace on the target. |
 | `--wait` | Wait for a `working` agent to go idle first. |
 | `--no-trust` | Don't answer the agent's "trust this folder?" screen on the target; leave it for the user. |
+| `--here` | Hand off on this machine, no ssh. Add `--new-worktree` or `--dir`. |
+| `--new-worktree` | With `--here`: move the session into a new worktree of the same repo. |
 | `--from HOST` | Run on HOST, where the agent is, over ssh. Works with `list`, `doctor` and `send`. |
 
 ## Repo discovery on the target

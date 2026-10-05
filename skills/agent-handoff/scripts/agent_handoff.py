@@ -26,7 +26,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 RESULT_MARK = "AGENT_HANDOFF_RESULT:"
 HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "agent-handoff"
@@ -565,7 +565,12 @@ def integration_state(kind: str) -> str:
 # ---------------------------------------------------------------- remote plumbing
 
 
+LOCAL = "local"  # target for --here: same machine, no ssh
+
+
 def remote(target: str, step: str, payload: dict) -> dict:
+    if target == LOCAL:
+        return REMOTE_STEPS[step](payload)
     source = Path(__file__).read_text()
     cmd = ["ssh", "-o", "BatchMode=yes", target,
            f"python3 - --remote {shlex.quote(step)} {shlex.quote(json.dumps(payload))}"]
@@ -648,7 +653,8 @@ def save_cache(cache: Dict[str, str]) -> None:
     (CONFIG_DIR / "repos.json").write_text(json.dumps(cache, indent=2, sort_keys=True) + "\n")
 
 
-def find_repo(remotes: List[str], branch: Optional[str], override: Optional[str]) -> Tuple[str, List[str]]:
+def find_repo(remotes: List[str], branch: Optional[str], override: Optional[str],
+              exclude: Tuple[str, ...] = ()) -> Tuple[str, List[str]]:
     if override:
         path = os.path.realpath(os.path.expanduser(override))
         if not set(remotes) & set(remotes_of(path)):
@@ -656,14 +662,15 @@ def find_repo(remotes: List[str], branch: Optional[str], override: Optional[str]
         matches = [path]
     else:
         cache = load_cache()
-        cached = [cache[r] for r in remotes if r in cache and os.path.isdir(cache[r])]
+        cached = [cache[r] for r in remotes
+                  if r in cache and os.path.isdir(cache[r]) and cache[r] not in exclude]
         matches = [p for p in cached if set(remotes) & set(remotes_of(p))]
         if not matches:
             seen = set()
             for root, depth in scan_roots():
                 for repo in iter_repos(root, depth):
                     real = os.path.realpath(repo)
-                    if real in seen:
+                    if real in seen or real in exclude:
                         continue
                     seen.add(real)
                     if set(remotes) & set(remotes_of(real)):
@@ -861,6 +868,13 @@ def rewrite_tree(src: Path, dst: Path, pairs: List[Tuple[str, str]],
 def send_files(target: str, mapping: Dict[str, str], pairs: List[Tuple[str, str]],
                verbatim: Tuple[str, ...] = ()) -> List[str]:
     """Copy {src abs path: dst abs path} to the target, rewriting paths inside."""
+    if target == LOCAL:
+        sent = []
+        for src_abs, dst_abs in mapping.items():
+            if Path(src_abs).exists():
+                rewrite_tree(Path(src_abs), Path(dst_abs), pairs, verbatim)
+                sent.append(dst_abs)
+        return sent
     sent = []
     with tempfile.TemporaryDirectory() as stage:
         for src_abs, dst_abs in mapping.items():
@@ -884,7 +898,7 @@ def send_files(target: str, mapping: Dict[str, str], pairs: List[Tuple[str, str]
 
 
 def ssh_git_url(target: str, path: str) -> str:
-    return f"ssh://{target}{path}"
+    return path if target == LOCAL else f"ssh://{target}{path}"
 
 
 def cmd_list(_args) -> None:
@@ -945,15 +959,33 @@ def cmd_send(args) -> None:
     rel = os.path.relpath(os.path.realpath(src_cwd), os.path.realpath(src_root))
     remotes = remotes_of(src_root)
     if not remotes:
-        raise HandoffError(f"{src_root} has no git remotes, so it can't be matched on {args.target}")
+        raise HandoffError(f"{src_root} has no git remotes, so it can't be matched on the target")
     branch = git(src_root, "symbolic-ref", "--short", "-q", "HEAD", check=False) or None
     primary, extras = adapter.locate(handle, src_cwd)
     sid8 = re.sub(r"[^A-Za-z0-9]", "", primary.stem)[-8:]
 
+    where = "this machine" if args.target == LOCAL else args.target
+    target_dir, new_branch = args.dir, args.new_branch
+    if args.target == LOCAL:
+        # Another checkout of the repo here, else a fresh worktree of this one.
+        src_real = os.path.realpath(src_root)
+        if target_dir and os.path.realpath(os.path.expanduser(target_dir)) == src_real:
+            raise HandoffError(f"the agent is already in {src_root}; pick another checkout, "
+                               f"or leave out --dir to get a new worktree")
+        if args.new_worktree:
+            target_dir = src_root
+        elif not target_dir:
+            try:
+                target_dir = find_repo(remotes, branch, None, exclude=(src_real,))[0]
+            except HandoffError:
+                target_dir = src_root
+        common = lambda d: os.path.realpath(git(d, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+        if common(target_dir) == common(src_root):
+            new_branch = True  # same repo: its branch is checked out here, so use handoff/<id>
     probe = remote(args.target, "probe", {"remotes": remotes, "branch": branch,
-                                          "dir": args.dir, "binary": adapter.binary, "kind": kind})
+                                          "dir": target_dir, "binary": adapter.binary, "kind": kind})
     check_herdr_version("this machine", herdr_version())
-    check_herdr_version(args.target, probe["herdr_version"])
+    check_herdr_version(where, probe["herdr_version"])
     plan = {"agent": agent.get("name") or pane, "kind": kind, "session": handle["value"],
             "transcript": str(primary), "source_repo": src_root, "branch": branch or "(detached)",
             "dirty": is_dirty(src_root), "target": args.target, "target_repo": probe["repo"],
@@ -971,12 +1003,12 @@ def cmd_send(args) -> None:
         refspecs = [f"+HEAD:refs/handoff/{sid8}/head"]
         if wip:
             refspecs.append(f"+{wip}:refs/handoff/{sid8}/wip")
-        log(f"pushing {branch or 'HEAD'}{' + uncommitted changes' if wip else ''} to {args.target}")
+        log(f"pushing {branch or 'HEAD'}{' + uncommitted changes' if wip else ''} to {where}")
         receive = [f"--receive-pack={probe['receive_pack']}"] if probe.get("receive_pack") else []
         run(["git", "-C", src_root, "push", "-q", "--no-verify", *receive,
              ssh_git_url(args.target, probe["repo"]), *refspecs])
         prep = remote(args.target, "prepare", {"repo": probe["repo"], "sid8": sid8, "branch": branch,
-                                               "new_branch": args.new_branch})
+                                               "new_branch": new_branch})
         dst_cwd = os.path.normpath(os.path.join(prep["worktree"], rel))
         mapping, extra_pairs, dst_handle = adapter.place(primary, dst_cwd, probe["home"],
                                                          probe["config_root"])
@@ -1013,7 +1045,7 @@ def cmd_send(args) -> None:
     stashed = False
     if wip and not args.keep_source_changes:
         git(src_root, "stash", "push", "-q", "--include-untracked",
-            "-m", f"agent-handoff: {sid8} moved to {args.target}")
+            "-m", f"agent-handoff: {sid8} moved to {where}" + (f" ({prep['worktree']})" if args.target == LOCAL else ""))
         stashed = True
     print(json.dumps({
         "ok": True, **plan, "target_worktree": prep["worktree"], "target_branch": prep["branch"],
@@ -1024,7 +1056,7 @@ def cmd_send(args) -> None:
         "target_trust_prompt": started["trust_prompt"],
         "target_waiting_for_user": started["waiting_for_user"],
         "source_changes_stashed": stashed, "source_pane_now_at_shell": pane,
-        "attach": f"herdr --remote {args.target}",
+        "attach": None if args.target == LOCAL else f"herdr --remote {args.target}",
     }, indent=2))
 
 
@@ -1071,6 +1103,11 @@ def main() -> None:
     s.add_argument("agent", help="herdr agent name, pane id, or session id prefix")
     s.add_argument("target", nargs="?",
                    help="ssh target, e.g. vega@vega (with --from, defaults to this machine)")
+    s.add_argument("--here", action="store_true",
+                   help="hand off on this machine (no ssh): to --dir, another checkout of the repo, "
+                        "or a new worktree")
+    s.add_argument("--new-worktree", action="store_true",
+                   help="with --here: move the session into a new worktree of the same repo")
     s.add_argument("--dir", help="checkout to use on the target (skips discovery)")
     s.add_argument("--name", help="agent name on the target")
     s.add_argument("--session", help="session id or path, if herdr doesn't report one")
@@ -1091,9 +1128,15 @@ def main() -> None:
     extra = argv[argv.index("--") + 1:] if "--" in argv else []
     args = ap.parse_args(argv[:argv.index("--")] if "--" in argv else argv)
     args.agent_args = extra
+    if args.cmd == "send" and args.here:
+        if args.target or args.from_host:
+            ap.error("--here hands off on this machine; don't also give a target or --from")
+        args.target = LOCAL
+    if args.cmd == "send" and args.new_worktree and not args.here:
+        ap.error("--new-worktree goes with --here")
     if args.cmd == "send" and not args.target:
         if not args.from_host:
-            ap.error("send needs a target (or --from HOST to bring an agent here)")
+            ap.error("send needs a target, --here, or --from HOST to bring an agent here")
         args.target = this_machine()
         i = argv.index(args.agent)
         argv = argv[:i + 1] + [args.target] + argv[i + 1:]

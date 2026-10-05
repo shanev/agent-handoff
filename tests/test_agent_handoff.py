@@ -206,6 +206,24 @@ class SessionLookup(TempDirTest):
             self.assertEqual(grok.guess_handle(cwd, time.time() - 60), {"kind": "id", "value": sid})
             self.assertEqual(grok.locate({"kind": "id", "value": sid}, cwd)[0], grok_sess)
 
+    def test_local_transport_copies_without_ssh(self):
+        src = self.tmp / "a" / "s.jsonl"
+        src.parent.mkdir()
+        src.write_text('"/w/repo"\n')
+        dst = self.tmp / "b" / "nested" / "s.jsonl"
+        real_run = subprocess.run
+
+        def no_ssh(cmd, *a, **kw):
+            if os.path.basename(cmd[0]) == "ssh":
+                raise AssertionError(f"local mode ran ssh: {cmd}")
+            return real_run(cmd, *a, **kw)
+        with mock.patch.object(ah.subprocess, "run", side_effect=no_ssh):
+            sent = ah.send_files(ah.LOCAL, {str(src): str(dst)}, [("/w/repo", "/w/repo.worktrees/x")])
+            self.assertEqual(ah.remote(ah.LOCAL, "cleanup-refs", {"repo": "/nonexistent", "sid8": "x"}), {})
+        self.assertEqual(sent, [str(dst)])
+        self.assertEqual(dst.read_text(), '"/w/repo.worktrees/x"\n')
+        self.assertEqual(ah.ssh_git_url(ah.LOCAL, "/w/r"), "/w/r")
+
     def test_verbatim_files_are_not_rewritten(self):
         src = self.tmp / "sess"
         (src / "nested").mkdir(parents=True)
@@ -373,6 +391,13 @@ class RepoDiscovery(TempDirTest):
         with self.assertRaisesRegex(ah.HandoffError, "no remote matching"):
             ah.find_repo(["github.com/o/elsewhere"], None, repo)
 
+    def test_exclude_skips_the_source_checkout(self):
+        src = self.make_repo("src/hark", "git@github.com:tensor-systems/hark.git")
+        other = self.make_repo("code/hark", "git@github.com:tensor-systems/hark.git")
+        self.assertEqual(ah.find_repo(["github.com/tensor-systems/hark"], None, None, exclude=(src,))[0], other)
+        with self.assertRaisesRegex(ah.HandoffError, "no checkout"):
+            ah.find_repo(["github.com/tensor-systems/hark"], None, None, exclude=(src, other))
+
     def test_roots_env_override(self):
         repo = self.make_repo("odd/place/hark", "git@github.com:tensor-systems/hark.git")
         with mock.patch.dict(os.environ, {"AGENT_HANDOFF_ROOTS": str(self.home / "odd")}):
@@ -476,6 +501,16 @@ class CommandLine(unittest.TestCase):
         with self.assertRaises(SystemExit), redirect_stdout(io.StringIO()), \
              mock.patch.object(sys, "stderr", io.StringIO()):
             self.main("send", "demo", "vega@vega", "--from", "vega@vega")
+
+    def test_here_targets_this_machine_without_ssh(self):
+        args = self.main("send", "demo", "--here", "--new-worktree", "--", "--model", "haiku")["args"]
+        self.assertEqual((args.target, args.new_worktree, args.agent_args), (ah.LOCAL, True, ["--model", "haiku"]))
+
+    def test_here_conflicts(self):
+        for argv in (["send", "demo", "vega@vega", "--here"], ["send", "demo", "--here", "--from", "vega@vega"],
+                     ["send", "demo", "vega@vega", "--new-worktree"]):
+            with self.assertRaises(SystemExit), mock.patch.object(sys, "stderr", io.StringIO()):
+                self.main(*argv)
 
     def test_send_needs_a_target_without_from(self):
         with self.assertRaises(SystemExit), mock.patch.object(sys, "stderr", io.StringIO()):

@@ -18,6 +18,8 @@ Once the skill is installed, just say what you want:
 
 > Bring the session that's running on vega back to my laptop.
 
+> Move my hark Claude session into its own worktree.
+
 > What agents could I hand off right now?
 
 > Is vega set up for handoffs?
@@ -33,6 +35,10 @@ A few things you might notice afterwards:
 - **Your laptop's checkout is clean.** The uncommitted changes went with the session, and the local copy is stashed. `git stash list` shows it, labelled `agent-handoff`.
 - **The agent may ask about trust on the other machine.** If it asks to trust the folder, the handoff answers yes, since you were already working in that repo. Pass `--no-trust` if you'd rather answer it yourself. Codex may also ask you to approve the herdr hook the handoff installed; that one is always left to you, and Hermes will say so.
 - **The original pane stays open** at a shell prompt.
+
+### On the same machine
+
+Handoffs work without a second machine, too. "Move my hark Claude session into its own worktree" moves the session, with its uncommitted changes, into a new worktree of the repo on a `handoff/<id>` branch, which frees the original checkout. "Move it to my other checkout" moves it into another clone you name. There's no SSH involved; everything else works the same.
 
 ## Install
 
@@ -83,6 +89,7 @@ python3 $S doctor vega@vega                      # check both machines
 python3 $S send hark-claude vega@vega --dry-run  # show the plan
 python3 $S send hark-claude vega@vega            # do it
 python3 $S send hark-claude --from vega@vega     # bring one back from vega
+python3 $S send hark-claude --here --new-worktree  # same machine, into a new worktree
 ```
 
 Run `python3 $S send --help` for every option.
