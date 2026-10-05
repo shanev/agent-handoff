@@ -26,7 +26,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 RESULT_MARK = "AGENT_HANDOFF_RESULT:"
 HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "agent-handoff"
@@ -734,6 +734,10 @@ def step_prepare(p: dict) -> dict:
     head_ref, wip_ref = f"refs/handoff/{sid8}/head", f"refs/handoff/{sid8}/wip"
     head = git(repo, "rev-parse", head_ref)
     branch = src_branch if (src_branch and not p.get("new_branch")) else f"handoff/{sid8}"
+    if branch.startswith("handoff/"):  # a fresh branch: don't reuse one an earlier handoff made
+        base, n = branch, 2
+        while ref_exists(repo, f"refs/heads/{branch}"):
+            branch, n = f"{base}-{n}", n + 1
     wts = worktrees(repo)
     current = [w for w in wts if w.get("branch") == f"refs/heads/{branch}"]
     created = False

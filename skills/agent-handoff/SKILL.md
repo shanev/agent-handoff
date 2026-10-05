@@ -1,7 +1,7 @@
 ---
 name: agent-handoff
 description: "Move a running coding-agent session (Claude Code, Codex, omp, pi, grok) from one machine to another over SSH, with its transcript, branch and uncommitted changes, and resume it in herdr on the target. Use when the user asks to hand off, move, transfer, or continue an agent session on another machine/host (e.g. 'move the hark claude to vega'), or on this machine into another checkout or its own worktree. Requires herdr on both machines."
-version: 0.4.0
+version: 0.4.1
 author: Shane Vitarana
 license: MIT
 platforms: [macos, linux]

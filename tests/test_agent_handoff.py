@@ -346,6 +346,13 @@ class GitTransport(TempDirTest):
         out = self.prepare(new_branch=True)
         self.assertEqual(out["branch"], "handoff/abcd1234")
 
+    def test_new_branch_never_reuses_an_existing_handoff_branch(self):
+        sh("git", "branch", "handoff/abcd1234", cwd=self.dst)
+        self.handoff_refs()
+        out = self.prepare(new_branch=True)
+        self.assertEqual(out["branch"], "handoff/abcd1234-2")
+        self.assertTrue(out["created_worktree"])
+
     def test_detached_source_uses_handoff_branch(self):
         sh("git", "checkout", "-q", "--detach", cwd=self.src)
         self.handoff_refs()
