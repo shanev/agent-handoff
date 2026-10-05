@@ -441,5 +441,29 @@ class CommandLine(unittest.TestCase):
         self.assertIn("missing on target", err_line["error"])
 
 
+class HermesScannerFriendly(unittest.TestCase):
+    """Hermes's skills-guard blocks community skills on HIGH/CRITICAL findings,
+    and a blocked update still prints "Updated 1 skill(s)". These are the
+    patterns it fires on (bare tokens, even in prose that forbids them)."""
+
+    BLOCKED = [
+        (r"authorized_keys", "ssh_backdoor (critical)"),
+        (r"\$HOME/\.ssh|~/\.ssh", "ssh_dir_access (high)"),
+        (r"^[^#\n]*os\.environ\b(?!\s*\.get\s*\()", "python_os_environ (high)"),
+        (r"printenv|env\s*\|", "dump_all_env (high)"),
+    ]
+
+    def test_skill_files_avoid_blocking_patterns(self):
+        import re
+        for f in (SCRIPT.parents[1]).rglob("*"):
+            if not f.is_file() or "__pycache__" in f.parts:
+                continue
+            text = f.read_text()
+            for rx, rule in self.BLOCKED:
+                for n, line in enumerate(text.splitlines(), 1):
+                    if re.search(rx, line, re.M):
+                        self.fail(f"{f.name}:{n} would trip Hermes {rule}: {line.strip()[:80]}")
+
+
 if __name__ == "__main__":
     unittest.main()

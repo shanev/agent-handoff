@@ -69,7 +69,7 @@ If this is the first handoff to a machine, run `doctor <ssh-target>` first. Repo
 
 If a step fails because of ssh (permission denied, host key verification, unknown host), a missing tool, herdr not running, or a logged-out agent, **stop and tell the user**. Give them the error and the fix, and let them do it. Do not:
 
-- add, copy or generate SSH keys, or edit `authorized_keys`, `known_hosts` or `~/.ssh/config`, on any machine;
+- add, copy or generate SSH keys, or edit any SSH file (the authorized-keys and known-hosts files, or the client config), on any machine;
 - try other usernames or hostnames until something connects. Use the names the user gave, or ask;
 - install software, or log agents in, on either machine;
 - change git config, discard changes, or delete stashes or worktrees.
