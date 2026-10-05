@@ -1,7 +1,7 @@
 ---
 name: agent-handoff
 description: "Move a running coding-agent session (Claude Code, Codex, omp) from one machine to another over SSH, with its transcript, branch and uncommitted changes, and resume it in herdr on the target. Use when the user asks to hand off, move, transfer, or continue an agent session on another machine/host (e.g. 'move the hark claude to vega'). Requires herdr on both machines."
-version: 0.2.0
+version: 0.2.1
 author: Shane Vitarana
 license: MIT
 platforms: [macos, linux]
@@ -39,7 +39,7 @@ python3 "$S" doctor <ssh-target>          # prerequisites here and on the target
 python3 "$S" send <agent> <ssh-target> --dry-run
 python3 "$S" send <agent> <ssh-target>
 python3 "$S" list --from <host>           # agents on another machine
-python3 "$S" send <agent> <ssh-target> --from <host>   # hand off an agent that runs on <host>
+python3 "$S" send <agent> --from <host>   # bring an agent on <host> back to this machine
 ```
 
 - `<agent>`: a herdr agent name, pane id (e.g. `w1Y:p7`), or session id prefix, taken from `list`.
@@ -49,7 +49,7 @@ Every command prints JSON. `send` ends with `"ok": true` and an `attach` command
 
 ## Procedure
 
-The handoff always runs on the machine where the agent is. If the user wants a session moved *from* another machine (for example "bring the hark session on vega back here"), add `--from <that machine>` to `list` and `send`. The target is then this machine's ssh name. If you don't know it, ask the user, because the other machine must be able to reach it.
+The handoff always runs on the machine where the agent is. To bring a session *back* from another machine (for example "bring the hark session on vega back here"), use `list --from <that machine>`, then `send <agent> --from <that machine>` with **no target**. The script fills in this machine's ssh name (`$AGENT_HANDOFF_SELF`, else `user@hostname`). Only pass a target with `--from` if the user names a third machine. Never pass the `--from` host as the target.
 
 If this is the first handoff to a machine, run `doctor <ssh-target>` first. Report anything missing (herdr not running, the agent CLI not installed, ssh failing), with the fix.
 
@@ -64,6 +64,17 @@ If this is the first handoff to a machine, run `doctor <ssh-target>` first. Repo
    - `hook_review`: Codex wants approval for a new or changed hook, usually the herdr hook the handoff just installed. Approving it lets herdr track Codex's state on that machine. Escape skips it, and hooks then don't run.
    - `unrecognized_prompt`: the agent stopped on a screen this tool doesn't know (often after an agent update reworded one). The user should attach and look.
 7. If `send` fails, quote its `error`. It ends with what to do (`--new-branch`, `--dir`, install something, wait for the agent).
+
+## Never fix access or setup yourself
+
+If a step fails because of ssh (permission denied, host key verification, unknown host), a missing tool, herdr not running, or a logged-out agent, **stop and tell the user**. Give them the error and the fix, and let them do it. Do not:
+
+- add, copy or generate SSH keys, or edit `authorized_keys`, `known_hosts` or `~/.ssh/config`, on any machine;
+- try other usernames or hostnames until something connects. Use the names the user gave, or ask;
+- install software, or log agents in, on either machine;
+- change git config, discard changes, or delete stashes or worktrees.
+
+Running `doctor` to diagnose is fine. Retrying with a corrected name the user gave you is fine.
 
 ## Options
 

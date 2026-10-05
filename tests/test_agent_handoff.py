@@ -406,6 +406,30 @@ class CommandLine(unittest.TestCase):
             self.assertEqual(seen["host"], "vega@vega")
             self.assertEqual(seen["rest"], ["send", "a", "me@laptop", "--", "--x"])
 
+    def test_from_without_target_brings_the_agent_here(self):
+        with mock.patch.dict(os.environ, {"AGENT_HANDOFF_SELF": "me@laptop"}):
+            seen = self.main("send", "demo", "--from", "vega@vega", "--", "--model", "haiku")
+        self.assertEqual(seen["rest"], ["send", "demo", "me@laptop", "--", "--model", "haiku"])
+
+    def test_from_host_as_target_is_refused(self):
+        with self.assertRaises(SystemExit), redirect_stdout(io.StringIO()), \
+             mock.patch.object(sys, "stderr", io.StringIO()):
+            self.main("send", "demo", "vega@vega", "--from", "vega@vega")
+
+    def test_send_needs_a_target_without_from(self):
+        with self.assertRaises(SystemExit), mock.patch.object(sys, "stderr", io.StringIO()):
+            self.main("send", "demo")
+
+    def test_ssh_failure_says_what_to_do_and_not_to_touch_keys(self):
+        done = subprocess.CompletedProcess([], 255, "", "Permission denied (publickey).\n")
+        with mock.patch.object(ah.subprocess, "run", return_value=done):
+            with self.assertRaises(ah.HandoffError) as e:
+                ah.remote("vega@m3max", "probe", {})
+        msg = str(e.exception)
+        self.assertIn("ssh -o BatchMode=yes vega@m3max true", msg)
+        self.assertIn("never changes ssh keys", msg)
+        self.assertNotIn("..", msg)
+
     def test_remote_step_reports_errors_as_json(self):
         buf = io.StringIO()
         with mock.patch.object(ah, "adopt_login_path"), redirect_stdout(buf):

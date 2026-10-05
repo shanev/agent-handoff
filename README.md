@@ -55,7 +55,7 @@ On both machines:
 
 Between them:
 
-- SSH that works without prompts, in both directions if you want to hand sessions back. Check with `ssh -o BatchMode=yes <host> true`. Tailscale works well for this.
+- SSH that works without prompts, in both directions if you want to hand sessions back. Check with `ssh -o BatchMode=yes <host> true`. Tailscale works well for this. To bring a session back, the other machine reaches this one as `you@this-hostname`; if that's not the right name, set `AGENT_HANDOFF_SELF=user@host`. The skill never sets up ssh for you; if it's missing, Hermes tells you what to fix.
 
 On the machine you hand off from, install herdr's integration for your agent (`herdr integration install claude`, and so on) so herdr records session ids. It isn't strictly needed: without it, the handoff falls back to the agent's newest transcript for that folder. On the receiving machine, the handoff installs the integration itself if it's missing.
 
@@ -77,12 +77,12 @@ If anything goes wrong once the agent has quit, including the agent failing to s
 The skill is a single script, so any agent that loads skills can use it, or you can run it yourself:
 
 ```bash
-S=~/.hermes/skills/autonomous-ai-agents/agent-handoff/scripts/agent_handoff.py
+S=~/.hermes/skills/agent-handoff/scripts/agent_handoff.py   # Hermes's default install location
 python3 $S list                                  # agents here
 python3 $S doctor vega@vega                      # check both machines
 python3 $S send hark-claude vega@vega --dry-run  # show the plan
 python3 $S send hark-claude vega@vega            # do it
-python3 $S send hark-claude laptop@laptop --from vega@vega   # bring one back from vega
+python3 $S send hark-claude --from vega@vega     # bring one back from vega
 ```
 
 Run `python3 $S send --help` for every option.

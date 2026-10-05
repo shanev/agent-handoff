@@ -10,11 +10,13 @@ Stdlib only, Python 3.9+ (macOS ships 3.9).
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tarfile
@@ -23,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 RESULT_MARK = "AGENT_HANDOFF_RESULT:"
 HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "agent-handoff"
@@ -487,7 +489,22 @@ def remote(target: str, step: str, payload: dict) -> dict:
             if not res["ok"]:
                 raise HandoffError(f"[{target}] {res['error']}")
             return res["data"]
+    if p.returncode == 255:
+        raise HandoffError(ssh_failure(target, p.stderr))
     raise HandoffError(f"[{target}] step '{step}' failed: {(p.stderr or p.stdout).strip()[-2000:]}")
+
+
+def this_machine() -> str:
+    """How other machines reach this one: $AGENT_HANDOFF_SELF, else user@short-hostname
+    (which is what Tailscale MagicDNS and most LANs resolve)."""
+    return os.environ.get("AGENT_HANDOFF_SELF") or f"{getpass.getuser()}@{socket.gethostname().split('.')[0]}"
+
+
+def ssh_failure(target: str, stderr: str) -> str:
+    return (f"can't ssh from {socket.gethostname().split('.')[0]} to {target}: {stderr.strip()[-300:].rstrip('.')}. "
+            f"agent-handoff needs ssh that works without prompts (`ssh -o BatchMode=yes {target} true`). "
+            f"If {target} is the wrong name for that machine, pass the right one; otherwise the user has "
+            f"to set up key-based ssh. agent-handoff never changes ssh keys or config.")
 
 
 def remote_main(step: str, payload: dict) -> None:
@@ -755,6 +772,8 @@ def send_files(target: str, mapping: Dict[str, str], pairs: List[Tuple[str, str]
         with open(archive, "rb") as fh:
             p = subprocess.run(["ssh", "-o", "BatchMode=yes", target, "tar -C / -xzf -"],
                                stdin=fh, capture_output=True, text=True)
+        if p.returncode == 255:
+            raise HandoffError(ssh_failure(target, p.stderr))
         archive.unlink()
         if p.returncode != 0:
             raise HandoffError(f"copying transcript to {target} failed: {p.stderr.strip()}")
@@ -947,7 +966,8 @@ def main() -> None:
     d.add_argument("target", nargs="?")
     s = sub.add_parser("send", help="hand an agent off to a target machine")
     s.add_argument("agent", help="herdr agent name, pane id, or session id prefix")
-    s.add_argument("target", help="ssh target, e.g. vega@vega")
+    s.add_argument("target", nargs="?",
+                   help="ssh target, e.g. vega@vega (with --from, defaults to this machine)")
     s.add_argument("--dir", help="checkout to use on the target (skips discovery)")
     s.add_argument("--name", help="agent name on the target")
     s.add_argument("--session", help="session id or path, if herdr doesn't report one")
@@ -968,6 +988,14 @@ def main() -> None:
     extra = argv[argv.index("--") + 1:] if "--" in argv else []
     args = ap.parse_args(argv[:argv.index("--")] if "--" in argv else argv)
     args.agent_args = extra
+    if args.cmd == "send" and not args.target:
+        if not args.from_host:
+            ap.error("send needs a target (or --from HOST to bring an agent here)")
+        args.target = this_machine()
+        i = argv.index(args.agent)
+        argv = argv[:i + 1] + [args.target] + argv[i + 1:]
+    if args.from_host and args.cmd == "send" and args.target == args.from_host:
+        ap.error(f"--from and the target are both {args.target}; the target is where the agent should go")
     if args.from_host:
         rest, skip = [], 0
         for a in argv:  # drop --from HOST / --from=HOST, keep everything else
