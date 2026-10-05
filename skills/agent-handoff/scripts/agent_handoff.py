@@ -57,8 +57,8 @@ def git(repo: str, *args: str, env: Optional[dict] = None, check: bool = True) -
 
 
 def herdr(*args: str) -> dict:
-    out = run(["herdr", *args])
-    return json.loads(out)["result"]
+    out = run(["herdr", *args]).strip()
+    return json.loads(out).get("result", {}) if out else {}  # send-text/send-keys print nothing
 
 
 def log(msg: str) -> None:
@@ -162,10 +162,20 @@ class Adapter:
     kind = ""
     binary = ""
     exit_text = "/exit"
+    # First-run "do you trust this folder?" screen, and the option that says yes.
+    trust_marker: Optional[str] = None
+    trust_yes: Optional[str] = None
+    # Screens that are the user's call (never answered by this tool), e.g. codex
+    # asking to trust the hook `herdr integration install` just added.
+    user_screens: Dict[str, str] = {}
 
     def locate(self, handle: dict, src_cwd: str) -> Tuple[Path, List[Path]]:
         """(primary transcript, extra files/dirs). All must live under $HOME."""
         raise NotImplementedError
+
+    def guess_handle(self, src_cwd: str, started_at: float) -> Optional[dict]:
+        """Find the session when herdr didn't record one. None if it can't."""
+        return None
 
     def place(self, primary: Path, src_cwd: str, dst_cwd: str, dst_home: str
               ) -> Tuple[Dict[str, str], List[Tuple[str, str]], str]:
@@ -178,6 +188,8 @@ class Adapter:
 
 class Claude(Adapter):
     kind = binary = "claude"
+    trust_marker = r"trust this folder"
+    trust_yes = r"Yes, I trust"
 
     def locate(self, handle, src_cwd):
         sid = handle["value"] if handle["kind"] == "id" else Path(handle["value"]).stem
@@ -206,6 +218,10 @@ class Claude(Adapter):
 
 class Codex(Adapter):
     kind = binary = "codex"
+    exit_text = "/quit"
+    trust_marker = r"Trust this folder\?"
+    trust_yes = r"Trust and continue"
+    user_screens = {"hook_review": r"Hooks need review"}
 
     def locate(self, handle, src_cwd):
         if handle["kind"] == "path":
@@ -217,6 +233,21 @@ class Codex(Adapter):
                 return hits[-1], []
         raise HandoffError(f"no Codex rollout for session {sid} under ~/.codex/sessions")
 
+    def guess_handle(self, src_cwd, started_at):
+        # herdr's codex integration doesn't report the thread id, and codex writes
+        # through a shared daemon, so match the newest rollout for this cwd that
+        # was written after the agent process started.
+        best = None
+        for f in (HOME / ".codex" / "sessions").glob("**/rollout-*.jsonl"):
+            mtime = f.stat().st_mtime
+            if mtime < started_at or (best and mtime <= best[0]):
+                continue
+            with open(f) as fh:
+                meta = json.loads(fh.readline() or "{}")
+            if meta.get("type") == "session_meta" and meta["payload"].get("cwd") == src_cwd:
+                best = (mtime, f)
+        return {"kind": "path", "value": str(best[1])} if best else None
+
     def place(self, primary, src_cwd, dst_cwd, dst_home):
         rel = str(primary.relative_to(HOME))
         sid = re.search(r"([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$", primary.name)
@@ -225,7 +256,8 @@ class Codex(Adapter):
         return {rel: rel}, [], sid.group(1)
 
     def resume_args(self, dst_handle):
-        return ["resume", dst_handle]
+        m = re.search(r"([0-9a-f]{8}-[0-9a-f-]{27})(?:\.jsonl)?$", dst_handle)
+        return ["resume", m.group(1) if m else dst_handle]
 
 
 class Omp(Adapter):
@@ -275,10 +307,23 @@ def find_agent(target: str) -> dict:
     return hits[0]
 
 
-def foreground(pane: str) -> Tuple[Optional[dict], int, int]:
+def foreground(pane: str, binary: str = "") -> Tuple[Optional[dict], int, int]:
+    """The agent's own process in the pane's foreground group (not a child it
+    spawned, like caffeinate), plus the group id and shell pid."""
     info = herdr("pane", "process-info", "--pane", pane)["process_info"]
     procs = info.get("foreground_processes") or []
-    return (procs[0] if procs else None), info["foreground_process_group_id"], info["shell_pid"]
+    mine = [p for p in procs if binary and os.path.basename(p.get("argv0") or "") == binary]
+    return (mine[0] if mine else None), info["foreground_process_group_id"], info["shell_pid"]
+
+
+def process_started_at(pid: int) -> float:
+    """Epoch seconds when pid started, from ps's [[dd-]hh:]mm:ss elapsed time."""
+    etime = run(["ps", "-o", "etime=", "-p", str(pid)]).strip()
+    days, _, clock = etime.rpartition("-")
+    secs = 0
+    for part in clock.split(":"):
+        secs = secs * 60 + int(part)
+    return time.time() - secs - int(days or 0) * 86400 - 5
 
 
 def wait_for_shell(pane: str, timeout: float) -> None:
@@ -311,11 +356,46 @@ def start_agent(name: str, kind: str, pane: str, args: List[str]) -> dict:
             return herdr("agent", "start", name, "--kind", kind, "--pane", pane,
                          "--timeout", "90000", "--", *args)
         except HandoffError as e:
+            # The agent may be up but stopped at a first-run screen (herdr reports
+            # that as blocked and fails the start); that still counts as started.
+            occupant = next((a for a in herdr("agent", "list")["agents"] if a["pane_id"] == pane), None)
+            if occupant and occupant["agent"] == kind:
+                return {"agent": occupant}
             last = e
             if "prompt" not in str(e) and "not available" not in str(e):
                 raise
             time.sleep(1)
     raise last  # type: ignore[misc]
+
+
+def answer_trust(pane: str, adapter: Adapter, accept: bool) -> str:
+    """Returns 'none' (no prompt), 'accepted', or 'pending' (left for the user)."""
+    if not adapter.trust_marker:
+        return "none"
+    for _ in range(8):
+        screen = run(["herdr", "pane", "read", pane, "--source", "visible", "--lines", "80"])
+        if re.search(adapter.trust_marker, screen):
+            break
+        time.sleep(0.5)
+    else:
+        return "none"
+    if not accept:
+        return "pending"
+    lines = screen.splitlines()
+    cursor = next((i for i, l in enumerate(lines) if re.match(r"\s*[❯›>]\s", l)), None)
+    yes = next((i for i, l in enumerate(lines) if re.search(adapter.trust_yes, l)), None)
+    if cursor is None or yes is None:
+        return "pending"
+    keys = ["down" if yes > cursor else "up"] * abs(yes - cursor) + ["enter"]
+    for k in keys:
+        herdr("pane", "send-keys", pane, k)
+        time.sleep(0.15)
+    for _ in range(10):
+        time.sleep(0.5)
+        screen = run(["herdr", "pane", "read", pane, "--source", "visible", "--lines", "80"])
+        if not re.search(adapter.trust_marker, screen):
+            return "accepted"
+    return "pending"
 
 
 def integration_state(kind: str) -> str:
@@ -511,8 +591,16 @@ def step_start(p: dict) -> dict:
     ws = herdr(*args)
     pane = ws["root_pane"]["pane_id"]
     start_agent(name, kind, pane, p["args"])
+    adapter = ADAPTERS[kind]
+    trust = answer_trust(pane, adapter, p.get("trust", True))
+    waiting = []
+    if adapter.user_screens:
+        time.sleep(1)
+        screen = run(["herdr", "pane", "read", pane, "--source", "visible", "--lines", "80"])
+        waiting = [k for k, rx in adapter.user_screens.items() if re.search(rx, screen)]
     return {"name": name, "pane_id": pane, "workspace_id": ws["workspace"]["workspace_id"],
-            "installed_integration": installed}
+            "installed_integration": installed, "trust_prompt": trust,
+            "waiting_for_user": waiting}
 
 
 def step_cleanup_refs(p: dict) -> dict:
@@ -608,6 +696,15 @@ def cmd_send(args) -> None:
     handle = agent.get("agent_session")
     if args.session:
         handle = {"kind": "path" if "/" in args.session else "id", "value": args.session}
+    proc, _, _ = foreground(pane, adapter.binary)
+    src_cwd = (proc or {}).get("cwd") or agent["cwd"]
+    if not handle and proc:
+        same_dir = [a for a in herdr("agent", "list")["agents"]
+                    if a["agent"] == kind and a["cwd"] == agent["cwd"]]
+        if len(same_dir) > 1:
+            raise HandoffError(f"{len(same_dir)} {kind} agents share {agent['cwd']} and herdr has no "
+                               f"session id for {pane}; pass --session <id-or-path>")
+        handle = adapter.guess_handle(src_cwd, process_started_at(proc["pid"]))
     if not handle:
         state = integration_state(kind)
         hint = (f"run `herdr integration install {kind}` and restart the agent"
@@ -621,8 +718,6 @@ def cmd_send(args) -> None:
         log(f"waiting for {pane} to go idle")
         herdr("agent", "wait", pane, "--until", "idle", "--until", "done", "--timeout", "1800000")
 
-    proc, _, _ = foreground(pane)
-    src_cwd = (proc or {}).get("cwd") or agent["cwd"]
     src_root = git(src_cwd, "rev-parse", "--show-toplevel")
     rel = os.path.relpath(os.path.realpath(src_cwd), os.path.realpath(src_root))
     remotes = remotes_of(src_root)
@@ -670,7 +765,7 @@ def cmd_send(args) -> None:
             name = f"a{name}"[:32]
         started = remote(args.target, "start", {
             "kind": kind, "name": name, "cwd": dst_cwd, "focus": not args.no_focus,
-            "label": f"{Path(prep['worktree']).name} ({kind})",
+            "label": f"{Path(prep['worktree']).name} ({kind})", "trust": not args.no_trust,
             "args": adapter.resume_args(dst_handle) + list(args.agent_args)})
     except Exception:
         log(f"handoff failed; restarting {kind} in {pane}")
@@ -692,6 +787,8 @@ def cmd_send(args) -> None:
         "applied_uncommitted_changes": prep["applied_changes"],
         "target_agent": started["name"], "target_pane": started["pane_id"],
         "installed_target_integration": started["installed_integration"],
+        "target_trust_prompt": started["trust_prompt"],
+        "target_waiting_for_user": started["waiting_for_user"],
         "source_changes_stashed": stashed, "source_pane_now_at_shell": pane,
         "attach": f"herdr --remote {args.target}",
     }, indent=2))
@@ -743,6 +840,8 @@ def main() -> None:
                    help="don't stash the source checkout's uncommitted changes after handoff")
     s.add_argument("--wait", action="store_true", help="wait for a working agent to go idle first")
     s.add_argument("--no-focus", action="store_true", help="don't focus the new workspace on the target")
+    s.add_argument("--no-trust", action="store_true",
+                   help="leave the agent's 'trust this folder?' prompt on the target for the user")
     s.add_argument("--dry-run", action="store_true", help="show the plan without changing anything")
     s.add_argument("agent_args", nargs="*", help="extra agent CLI args, after --")
     args = ap.parse_args()
