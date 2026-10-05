@@ -1,5 +1,7 @@
 # agent-handoff
 
+[![test](https://github.com/shanev/agent-handoff/actions/workflows/test.yml/badge.svg)](https://github.com/shanev/agent-handoff/actions/workflows/test.yml)
+
 Move a running coding-agent session to another machine and keep going there.
 
 Say you're working with Claude Code on your laptop and want the session to keep running on the Mac mini at home, or you're at the mini and want the laptop's session over here. Ask Hermes to hand it off. It quits the agent, moves the conversation, the branch and your uncommitted changes, and resumes the same session in [herdr](https://herdr.dev) on the other machine. The repo can live at a different path there; it's matched by its git remote.
@@ -92,6 +94,14 @@ macOS (Apple silicon), zsh/bash/sh, herdr 0.8.0 and 0.9.3, Claude Code 2.1, Code
 ## Adding an agent
 
 Each agent is a small adapter class in [`agent_handoff.py`](skills/agent-handoff/scripts/agent_handoff.py). It says where the transcript lives, where it goes on the other machine, how to resume it, and what its "trust this folder?" screen looks like. PRs for more agents are welcome.
+
+## Running the tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Stdlib only, no installs needed. The tests cover remote matching, session paths, repo discovery and the trust-screen logic, and they run the git handoff steps against real temporary repos. CI runs them on Linux and macOS with Python 3.9 and 3.13.
 
 ## License
 
