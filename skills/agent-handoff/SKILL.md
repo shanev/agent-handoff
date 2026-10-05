@@ -41,7 +41,7 @@ python3 "$S" send <agent> <ssh-target>
 ```
 
 - `<agent>`: a herdr agent name, pane id (e.g. `w1Y:p7`), or session id prefix, taken from `list`.
-- `<ssh-target>`: whatever `ssh` accepts non-interactively (e.g. `vega@vega`, a tailnet name, or an `~/.ssh/config` alias).
+- `<ssh-target>`: whatever `ssh` accepts non-interactively (e.g. `vega@vega`, a tailnet name, or an SSH config alias).
 
 Every command prints JSON. `send` ends with `"ok": true` and an `attach` command, or `"ok": false` and an `error`.
 

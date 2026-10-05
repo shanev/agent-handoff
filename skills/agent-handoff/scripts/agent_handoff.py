@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -36,10 +37,18 @@ class HandoffError(Exception):
 # ---------------------------------------------------------------- process helpers
 
 
-def run(cmd: List[str], cwd: Optional[str] = None, env: Optional[dict] = None,
+LOGIN_PATH: Optional[str] = None  # set by adopt_login_path() on the target
+
+
+def resolve(cmd: List[str]) -> List[str]:
+    return [shutil.which(cmd[0], path=LOGIN_PATH) or cmd[0], *cmd[1:]]
+
+
+def run(cmd: List[str], cwd: Optional[str] = None,
         input: Optional[str] = None, check: bool = True) -> str:
+    cmd = resolve(cmd)
     try:
-        p = subprocess.run(cmd, cwd=cwd, env=env, input=input, capture_output=True, text=True)
+        p = subprocess.run(cmd, cwd=cwd, input=input, capture_output=True, text=True)
     except FileNotFoundError:
         raise HandoffError(f"`{cmd[0]}` not found on PATH")
     if check and p.returncode != 0:
@@ -49,11 +58,19 @@ def run(cmd: List[str], cwd: Optional[str] = None, env: Optional[dict] = None,
 
 
 def ok(cmd: List[str], cwd: Optional[str] = None) -> bool:
-    return subprocess.run(cmd, cwd=cwd, capture_output=True).returncode == 0
+    try:
+        return subprocess.run(resolve(cmd), cwd=cwd, capture_output=True).returncode == 0
+    except FileNotFoundError:
+        return False
 
 
-def git(repo: str, *args: str, env: Optional[dict] = None, check: bool = True) -> str:
-    return run(["git", "-C", repo, *args], env=env, check=check).strip()
+def have(binary: str) -> bool:
+    return shutil.which(binary, path=LOGIN_PATH) is not None
+
+
+def git(repo: str, *args: str, index_file: Optional[str] = None, check: bool = True) -> str:
+    prefix = ["env", f"GIT_INDEX_FILE={index_file}"] if index_file else []
+    return run([*prefix, "git", "-C", repo, *args], check=check).strip()
 
 
 def herdr(*args: str) -> dict:
@@ -66,8 +83,10 @@ def log(msg: str) -> None:
 
 
 def adopt_login_path() -> None:
-    """Non-interactive ssh gets a bare PATH; borrow the login shell's so herdr,
-    claude, codex, omp (often in /opt/homebrew/bin or ~/.local/bin) resolve."""
+    """Non-interactive ssh gets a bare PATH; resolve commands against the login
+    shell's PATH so herdr, claude, codex, omp (often in /opt/homebrew/bin or
+    ~/.local/bin) are found."""
+    global LOGIN_PATH
     shell = os.environ.get("SHELL") or "/bin/sh"
     try:
         out = subprocess.run([shell, "-ilc", 'printf "\\n__AH_PATH__%s\\n" "$PATH"'],
@@ -82,7 +101,7 @@ def adopt_login_path() -> None:
     for p in parts:
         if p and p not in seen:
             seen.append(p)
-    os.environ["PATH"] = ":".join(seen)
+    LOGIN_PATH = ":".join(seen)
 
 
 # ---------------------------------------------------------------- git helpers
@@ -520,7 +539,7 @@ def find_repo(remotes: List[str], branch: Optional[str], override: Optional[str]
 
 
 def step_probe(p: dict) -> dict:
-    missing = [b for b in ("git", "herdr", p["binary"]) if not ok(["which", b])]
+    missing = [b for b in ("git", "herdr", p["binary"]) if not have(b)]
     if missing:
         raise HandoffError(f"missing on target: {', '.join(missing)}")
     try:
@@ -624,9 +643,8 @@ def make_wip(repo: str) -> Optional[str]:
         tmp_index = os.path.join(tmp, "index")
         if os.path.exists(index):
             Path(tmp_index).write_bytes(Path(index).read_bytes())
-        env = dict(os.environ, GIT_INDEX_FILE=tmp_index)
-        git(repo, "add", "-A", env=env)
-        tree = git(repo, "write-tree", env=env)
+        git(repo, "add", "-A", index_file=tmp_index)
+        tree = git(repo, "write-tree", index_file=tmp_index)
     if tree == git(repo, "rev-parse", "HEAD^{tree}"):
         return None
     return git(repo, "commit-tree", tree, "-p", "HEAD", "-m", "agent-handoff wip")
@@ -800,7 +818,7 @@ def cmd_send(args) -> None:
 
 def cmd_doctor(args) -> None:
     report = {"version": VERSION, "herdr_env": os.environ.get("HERDR_ENV") == "1",
-              "tools": {b: ok(["which", b]) for b in ("git", "herdr", "ssh", *ADAPTERS)},
+              "tools": {b: have(b) for b in ("git", "herdr", "ssh", *ADAPTERS)},
               "integrations": {k: integration_state(k) for k in ADAPTERS}}
     if args.target:
         try:
@@ -812,10 +830,10 @@ def cmd_doctor(args) -> None:
 
 def step_doctor(_p: dict) -> dict:
     return {"home": str(HOME), "python": sys.version.split()[0],
-            "tools": {b: ok(["which", b]) for b in ("git", "herdr", *ADAPTERS)},
+            "tools": {b: have(b) for b in ("git", "herdr", *ADAPTERS)},
             "herdr_server": ok(["herdr", "workspace", "list"]),
             "integrations": {k: integration_state(k) for k in ADAPTERS}
-            if ok(["which", "herdr"]) else {}}
+            if have("herdr") else {}}
 
 
 REMOTE_STEPS["doctor"] = step_doctor
