@@ -72,6 +72,15 @@ class SessionDirNames(unittest.TestCase):
         self.assertEqual(ah.omp_session_dir("/Users/a/github.com/o/r", "/Users/a"), "-github.com-o-r")
         self.assertEqual(ah.omp_session_dir("/Users/a", "/Users/a"), "-")
 
+    def test_pi_uses_absolute_path(self):
+        # matches pi's session-manager.js and the folders it writes
+        self.assertEqual(ah.pi_session_dir("/Users/a/github.com/o/r"), "--Users-a-github.com-o-r--")
+        self.assertEqual(ah.pi_session_dir("/private/tmp/x"), "--private-tmp-x--")
+
+    def test_grok_url_encodes_path(self):
+        self.assertEqual(ah.grok_session_dir("/Users/a/github.com/o/my-repo"),
+                         "%2FUsers%2Fa%2Fgithub.com%2Fo%2Fmy-repo")
+
     def test_omp_outside_home(self):
         # matches what omp itself writes for /private/tmp/...
         self.assertEqual(ah.omp_session_dir("/private/tmp/x/y", "/Users/a"), "--private-tmp-x-y--")
@@ -102,6 +111,22 @@ class Adapters(unittest.TestCase):
         self.assertEqual(handle, "/home/b/.omp/agent/sessions/-code-r/2026_x.jsonl")
         self.assertIn(("sessions/-src-r/", "sessions/-code-r/"), pairs)
         self.assertEqual(ah.ADAPTERS["omp"].resume_args(handle), ["--resume", handle])
+
+    def test_pi_place_and_resume(self):
+        src = Path("/Users/a/.pi/agent/sessions/--Users-a-r--/2026_x.jsonl")
+        mapping, pairs, handle = ah.ADAPTERS["pi"].place(src, "/home/b/code/r", "/home/b", "/home/b/.pi/agent")
+        self.assertEqual(handle, "/home/b/.pi/agent/sessions/--home-b-code-r--/2026_x.jsonl")
+        self.assertIn(("sessions/--Users-a-r--/", "sessions/--home-b-code-r--/"), pairs)
+        self.assertEqual(ah.ADAPTERS["pi"].resume_args(handle), ["--session", handle])
+        self.assertEqual(ah.ADAPTERS["pi"].exit_text, "/quit")
+
+    def test_grok_place_moves_session_dir(self):
+        sid = "01a10d2f-ab85-7df1-b933-b959dec56df9"
+        src = Path(f"/Users/a/.grok/sessions/%2FUsers%2Fa%2Fr/{sid}")
+        mapping, pairs, handle = ah.ADAPTERS["grok"].place(src, "/home/b/code/r", "/home/b", "/home/b/.grok")
+        self.assertEqual(mapping[str(src)], f"/home/b/.grok/sessions/%2Fhome%2Fb%2Fcode%2Fr/{sid}")
+        self.assertIn(("/Users/a/.grok/", "/home/b/.grok/"), pairs)
+        self.assertEqual(ah.ADAPTERS["grok"].resume_args(handle), ["--resume", sid])
 
     def test_config_root_env_override(self):
         claude = ah.ADAPTERS["claude"]
@@ -161,6 +186,42 @@ class SessionLookup(TempDirTest):
         with mock.patch.dict(os.environ, {"CODEX_HOME": str(root)}):
             got = ah.ADAPTERS["codex"].guess_handle("/work/r", time.time() - 60)
         self.assertEqual(got, {"kind": "path", "value": str(mine)})
+
+    def test_pi_and_grok_locate_and_guess(self):
+        cwd = "/work/r"
+        pi_root, grok_root = self.tmp / "pi", self.tmp / "grok"
+        pi_dir = pi_root / "sessions" / ah.pi_session_dir(cwd)
+        pi_dir.mkdir(parents=True)
+        pi_file = pi_dir / "2026-10-05T17-49-00-374Z_01a10d2e-e856-758d-8fd7-750f4070e0fb.jsonl"
+        pi_file.write_text("{}\n")
+        sid = "01a10d2f-ab85-7df1-b933-b959dec56df9"
+        grok_sess = grok_root / "sessions" / ah.grok_session_dir(cwd) / sid
+        grok_sess.mkdir(parents=True)
+        (grok_sess / "chat_history.jsonl").write_text("{}\n")
+        env = {"PI_CODING_AGENT_DIR": str(pi_root), "GROK_HOME": str(grok_root)}
+        with mock.patch.dict(os.environ, env):
+            pi, grok = ah.ADAPTERS["pi"], ah.ADAPTERS["grok"]
+            self.assertEqual(pi.guess_handle(cwd, time.time() - 60), {"kind": "path", "value": str(pi_file)})
+            self.assertEqual(pi.locate({"kind": "id", "value": "01a10d2e"}, cwd)[0], pi_file)
+            self.assertEqual(grok.guess_handle(cwd, time.time() - 60), {"kind": "id", "value": sid})
+            self.assertEqual(grok.locate({"kind": "id", "value": sid}, cwd)[0], grok_sess)
+
+    def test_verbatim_files_are_not_rewritten(self):
+        src = self.tmp / "sess"
+        (src / "nested").mkdir(parents=True)
+        (src / "chat_history.jsonl").write_text('"/Users/a/repo"\n')
+        (src / "rewind_points.jsonl").write_text('"/Users/a/repo"\n')  # the user's file contents
+        ah.rewrite_tree(src, self.tmp / "out", [("/Users/a/repo", "/home/b/r")], ("rewind_points.jsonl",))
+        self.assertEqual((self.tmp / "out" / "chat_history.jsonl").read_text(), '"/home/b/r"\n')
+        self.assertEqual((self.tmp / "out" / "rewind_points.jsonl").read_text(), '"/Users/a/repo"\n')
+
+    def test_rewriter_is_one_pass_and_respects_path_boundaries(self):
+        rewrite = ah.path_rewriter([("/private/tmp/x/pg", "/private/tmp/x/pg2"),
+                                    ("/tmp/x/pg", "/private/tmp/x/pg2"),
+                                    ("/Users/a/", "/Users/b/")])
+        self.assertEqual(
+            rewrite('"/private/tmp/x/pg" "/tmp/x/pg/f.py" "/tmp/x/pg-old" "/Users/a/.pi"'),
+            '"/private/tmp/x/pg2" "/private/tmp/x/pg2/f.py" "/tmp/x/pg-old" "/Users/b/.pi"')
 
     def test_rewrite_tree_rewrites_text_and_leaves_binary(self):
         src = self.tmp / "src"

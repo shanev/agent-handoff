@@ -6,7 +6,7 @@ Move a running coding-agent session to another machine and keep going there.
 
 Say you're working with Claude Code on your laptop and want the session to keep running on the Mac mini at home, or you're at the mini and want the laptop's session over here. Ask Hermes to hand it off. It quits the agent, moves the conversation, the branch and your uncommitted changes, and resumes the same session in [herdr](https://herdr.dev) on the other machine. The repo can live at a different path there; it's matched by its git remote.
 
-Works with **Claude Code**, **Codex** and **omp**.
+Works with **Claude Code**, **Codex**, **omp**, **pi** and **grok**.
 
 ## Using it in Hermes
 
@@ -50,7 +50,7 @@ On both machines:
 
 - [herdr](https://herdr.dev) 0.8.0 or newer, with its server running, and the agents running inside herdr panes.
 - `python3` 3.9 or newer, plus `git`, `ssh` and `tar`. Stock macOS has all of these.
-- The agent's CLI (`claude`, `codex` or `omp`), installed and logged in.
+- The agent's CLI (`claude`, `codex`, `omp`, `pi` or `grok`), installed and logged in.
 - A clone of the repo, with a git remote so it can be matched.
 
 Between them:
@@ -66,7 +66,7 @@ On the machine you hand off from, install herdr's integration for your agent (`h
 3. Quits the agent so its transcript is final.
 4. Sends your commits and a snapshot of uncommitted and untracked files **directly to the other machine over SSH**. Nothing is pushed to GitHub, and no branch is force-updated.
 5. Fast-forwards the branch where it's checked out on the other machine, or creates a worktree at `<repo>.worktrees/<branch>`, then applies your changes.
-6. Copies the transcript into the agent's session folder there (honouring `CLAUDE_CONFIG_DIR` and `CODEX_HOME`) and rewrites the old paths inside it.
+6. Copies the transcript into the agent's session folder there (honouring `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `PI_CODING_AGENT_DIR` and `GROK_HOME`) and rewrites the old paths inside it.
 7. Opens a herdr workspace there and resumes the session.
 8. Stashes the changes on the machine it left.
 
@@ -89,7 +89,7 @@ Run `python3 $S send --help` for every option.
 
 ## Tested on
 
-macOS (Apple silicon), zsh/bash/sh, herdr 0.8.0 and 0.9.3, Claude Code 2.1, Codex 0.160 and omp, between a MacBook and a Mac mini over Tailscale. Linux should work, since nothing in it is macOS-specific, but it hasn't been tried yet. Reports welcome.
+macOS (Apple silicon), zsh/bash/sh, herdr 0.8.0 and 0.9.3. Claude Code 2.1 and Codex 0.160 between a MacBook and a Mac mini over Tailscale. omp, pi 0.84 and grok 1.0.46 between two checkouts on one Mac, with the ssh steps done locally. Linux should work, since nothing in it is macOS-specific, but it hasn't been tried yet. Reports welcome.
 
 ## Adding an agent
 

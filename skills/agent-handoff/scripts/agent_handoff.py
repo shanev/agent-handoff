@@ -22,10 +22,11 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 RESULT_MARK = "AGENT_HANDOFF_RESULT:"
 HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "agent-handoff"
@@ -85,7 +86,7 @@ def log(msg: str) -> None:
     print(f"agent-handoff: {msg}", file=sys.stderr, flush=True)
 
 
-CONFIG_VARS = ("CLAUDE_CONFIG_DIR", "CODEX_HOME")
+CONFIG_VARS = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR", "GROK_HOME")
 
 
 def adopt_login_path() -> None:
@@ -202,6 +203,8 @@ class Adapter:
     # Screens that are the user's call (never answered by this tool), e.g. codex
     # asking to trust the hook `herdr integration install` just added.
     user_screens: Dict[str, str] = {}
+    # Files/dirs holding snapshots of the user's own files: copied without rewriting.
+    verbatim: Tuple[str, ...] = ()
 
     def config_root(self, env: Dict[str, str]) -> Path:
         custom = env.get(self.config_var) if self.config_var else None
@@ -238,6 +241,7 @@ def newest_since(files, started_at: float) -> Optional[Path]:
 class Claude(Adapter):
     kind = binary = "claude"
     config_var, default_root = "CLAUDE_CONFIG_DIR", ".claude"
+    verbatim = ("file-history",)
     trust_marker = r"trust this folder"
     trust_yes = r"Yes, I trust"
 
@@ -354,7 +358,90 @@ class Omp(Adapter):
         return ["--resume", dst_handle]
 
 
-ADAPTERS: Dict[str, Adapter] = {a.kind: a for a in (Claude(), Codex(), Omp())}
+def pi_session_dir(cwd: str) -> str:
+    """pi's sessions/<dir> for a cwd (session-manager.js getDefaultSessionDirPath)."""
+    return "--" + re.sub(r"[/\\:]", "-", re.sub(r"^[/\\]", "", cwd)) + "--"
+
+
+class Pi(Adapter):
+    kind = binary = "pi"
+    exit_text = "/quit"
+    config_var, default_root = "PI_CODING_AGENT_DIR", ".pi/agent"
+
+    def locate(self, handle, src_cwd):
+        if handle["kind"] == "path":
+            primary = Path(handle["value"])
+        else:  # partial UUID, as `pi --session` accepts
+            hits = [f for root in self.source_roots()
+                    for f in sorted((root / "sessions").glob(f"*/*{handle['value']}*.jsonl"))]
+            if not hits:
+                raise HandoffError(f"no pi session matching {handle['value']}")
+            primary = hits[0]
+        if not primary.exists():
+            raise HandoffError(f"pi session file {primary} does not exist")
+        sibling = primary.with_suffix("")
+        return primary, [sibling] if sibling.exists() else []
+
+    def guess_handle(self, src_cwd, started_at):
+        for root in self.source_roots():
+            f = newest_since((root / "sessions" / pi_session_dir(src_cwd)).glob("*.jsonl"), started_at)
+            if f:
+                return {"kind": "path", "value": str(f)}
+        return None
+
+    def place(self, primary, dst_cwd, dst_home, dst_root):
+        src_dir, dst_dir = primary.parent.name, pi_session_dir(dst_cwd)
+        dst = f"{dst_root}/sessions/{dst_dir}"
+        mapping = {str(primary): f"{dst}/{primary.name}",
+                   str(primary.with_suffix("")): f"{dst}/{primary.stem}"}
+        return mapping, [(f"{primary.parents[2]}/", f"{dst_root}/"),
+                         (f"sessions/{src_dir}/", f"sessions/{dst_dir}/")], f"{dst}/{primary.name}"
+
+    def resume_args(self, dst_handle):
+        return ["--session", dst_handle]
+
+
+def grok_session_dir(cwd: str) -> str:
+    return urllib.parse.quote(cwd, safe="")
+
+
+class Grok(Adapter):
+    """Each session is a directory: <GROK_HOME>/sessions/<url-encoded cwd>/<uuid>/.
+    grok has no folder-trust screen (its trust is opt-in, for hooks only)."""
+    kind = binary = "grok"
+    config_var, default_root = "GROK_HOME", ".grok"
+    verbatim = ("rewind_points.jsonl",)  # snapshots of the user's files
+
+    def locate(self, handle, src_cwd):
+        sid = handle["value"] if handle["kind"] == "id" else Path(handle["value"]).name
+        for root in self.source_roots():
+            preferred = root / "sessions" / grok_session_dir(src_cwd) / sid
+            hits = [preferred] if preferred.is_dir() else [
+                d for d in sorted((root / "sessions").glob(f"*/{sid}")) if d.is_dir()]
+            if hits:
+                return hits[0], []
+        raise HandoffError(f"no grok session {sid} under "
+                           f"{', '.join(str(r) for r in self.source_roots())}")
+
+    def guess_handle(self, src_cwd, started_at):
+        for root in self.source_roots():
+            f = newest_since((root / "sessions" / grok_session_dir(src_cwd)).glob("*/chat_history.jsonl"),
+                             started_at)
+            if f:
+                return {"kind": "id", "value": f.parent.name}
+        return None
+
+    def place(self, primary, dst_cwd, dst_home, dst_root):
+        src_root, src_dir, dst_dir = primary.parents[2], primary.parent.name, grok_session_dir(dst_cwd)
+        return ({str(primary): f"{dst_root}/sessions/{dst_dir}/{primary.name}"},
+                [(f"{src_root}/", f"{dst_root}/"), (f"sessions/{src_dir}/", f"sessions/{dst_dir}/")],
+                primary.name)
+
+    def resume_args(self, dst_handle):
+        return ["--resume", dst_handle]
+
+
+ADAPTERS: Dict[str, Adapter] = {a.kind: a for a in (Claude(), Codex(), Omp(), Pi(), Grok())}
 
 
 def adapter_for(kind: str) -> Adapter:
@@ -738,32 +825,48 @@ def make_wip(repo: str) -> Optional[str]:
     return git(repo, "commit-tree", tree, "-p", "HEAD", "-m", "agent-handoff wip")
 
 
-def rewrite_tree(src: Path, dst: Path, pairs: List[Tuple[str, str]]) -> None:
+def path_rewriter(pairs: List[Tuple[str, str]]):
+    """One-pass replacement of path strings. Sequential str.replace would
+    re-rewrite its own output (the /tmp alias matching inside a fresh
+    /private/tmp/...) and would hit prefixes (/x/repo inside /x/repo-old), so
+    match all sources at once, longest first, and only at a path-component end."""
+    table: Dict[str, str] = {}
+    for a, b in pairs:
+        if a and a != b:
+            table.setdefault(a, b)
+    if not table:
+        return lambda text: text
+    alts = sorted(table, key=len, reverse=True)
+    rx = re.compile("|".join(re.escape(a) + ("" if a.endswith("/") else r"(?![A-Za-z0-9._-])")
+                             for a in alts))
+    return lambda text: rx.sub(lambda m: table[m.group(0)], text)
+
+
+def rewrite_tree(src: Path, dst: Path, pairs: List[Tuple[str, str]],
+                 verbatim: Tuple[str, ...] = ()) -> None:
+    rewrite = path_rewriter(pairs)
     items = [src] if src.is_file() else [p for p in src.rglob("*") if p.is_file()]
     for item in items:
         out = dst if src.is_file() else dst / item.relative_to(src)
         out.parent.mkdir(parents=True, exist_ok=True)
         data = item.read_bytes()
-        if item.suffix in TEXT_SUFFIXES:
+        if item.suffix in TEXT_SUFFIXES and not set(item.parts) & set(verbatim):
             try:
-                text = data.decode("utf-8")
-                for a, b in pairs:
-                    text = text.replace(a, b)
-                data = text.encode("utf-8")
+                data = rewrite(data.decode("utf-8")).encode("utf-8")
             except UnicodeDecodeError:
                 pass  # binary file with a text-ish suffix: copy unchanged
         out.write_bytes(data)
 
 
-def send_files(target: str, mapping: Dict[str, str], pairs: List[Tuple[str, str]]) -> List[str]:
+def send_files(target: str, mapping: Dict[str, str], pairs: List[Tuple[str, str]],
+               verbatim: Tuple[str, ...] = ()) -> List[str]:
     """Copy {src abs path: dst abs path} to the target, rewriting paths inside."""
     sent = []
     with tempfile.TemporaryDirectory() as stage:
         for src_abs, dst_abs in mapping.items():
             src, rel = Path(src_abs), dst_abs.lstrip("/")
             if src.exists():
-                # file-history holds backups of the user's own files: copy them verbatim
-                rewrite_tree(src, Path(stage) / rel, [] if "file-history" in src_abs else pairs)
+                rewrite_tree(src, Path(stage) / rel, pairs, verbatim)
                 sent.append(rel)
         archive = Path(stage).with_suffix(".tgz")
         with tarfile.open(archive, "w:gz") as tar:
@@ -885,7 +988,7 @@ def cmd_send(args) -> None:
         roots |= {r[len("/private"):] for r in roots if re.match(r"^/private/(tmp|var|etc)/", r)}
         pairs = [(r, prep["worktree"]) for r in sorted(roots, key=len, reverse=True)]
         pairs += extra_pairs + [(str(HOME) + "/", probe["home"].rstrip("/") + "/")]
-        sent = send_files(args.target, mapping, [(a, b) for a, b in pairs if a != b])
+        sent = send_files(args.target, mapping, [(a, b) for a, b in pairs if a != b], adapter.verbatim)
         log(f"copied {len(sent)} session file(s)")
         name = args.name or agent.get("name") or re.sub(
             r"[^a-z0-9_-]", "-", f"{Path(src_root).name}-{kind}".lower()).strip("-")[:32]

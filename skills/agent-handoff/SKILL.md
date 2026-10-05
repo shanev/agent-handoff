@@ -1,13 +1,13 @@
 ---
 name: agent-handoff
-description: "Move a running coding-agent session (Claude Code, Codex, omp) from one machine to another over SSH, with its transcript, branch and uncommitted changes, and resume it in herdr on the target. Use when the user asks to hand off, move, transfer, or continue an agent session on another machine/host (e.g. 'move the hark claude to vega'). Requires herdr on both machines."
-version: 0.2.1
+description: "Move a running coding-agent session (Claude Code, Codex, omp, pi, grok) from one machine to another over SSH, with its transcript, branch and uncommitted changes, and resume it in herdr on the target. Use when the user asks to hand off, move, transfer, or continue an agent session on another machine/host (e.g. 'move the hark claude to vega'). Requires herdr on both machines."
+version: 0.3.0
 author: Shane Vitarana
 license: MIT
 platforms: [macos, linux]
 metadata:
   hermes:
-    tags: [Coding-Agent, herdr, Handoff, Claude, Codex, omp, SSH, Tailscale]
+    tags: [Coding-Agent, herdr, Handoff, Claude, Codex, omp, pi, grok, SSH, Tailscale]
     related_skills: [herdr, claude-code, codex]
 ---
 
@@ -22,7 +22,7 @@ One handoff does all of this:
 3. Quits the agent cleanly (`/exit`), so nothing else writes to the transcript.
 4. Pushes `HEAD` plus a snapshot of uncommitted changes **straight to the target over ssh** (`refs/handoff/*`, removed afterwards). Nothing is pushed to GitHub, and no branch on either side is rewritten.
 5. On the target: fast-forwards the branch where it is already checked out, or else makes a worktree next to the repo (`<repo>.worktrees/<branch>`), then applies the uncommitted changes.
-6. Copies the transcript into the target agent's session store (honouring `CLAUDE_CONFIG_DIR` / `CODEX_HOME` on either side), replacing the old repo path, home directory and config folder with the new ones inside it.
+6. Copies the transcript into the target agent's session store (honouring `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `PI_CODING_AGENT_DIR` and `GROK_HOME` on either side), replacing the old repo path, home directory and config folder with the new ones inside it.
 7. Installs the herdr integration for that agent on the target if it's missing (so the next handoff back knows the session id), opens a herdr workspace there and resumes the agent. If the agent asks whether to trust the folder, the script answers yes: the user was already working in this repo on the source. Pass `--no-trust` to leave that question for the user.
 8. Stashes the uncommitted changes in the source checkout (`git stash list` shows them), so a later handoff back applies cleanly.
 
@@ -96,7 +96,7 @@ Checkouts are matched by any git remote (`git@github.com:o/r.git` and `https://g
 
 ## Limits
 
-- Supported agents: `claude`, `codex`, `omp`. Others (including `hermes`) fail with a clear error. Adding one means adding an adapter class to the script.
+- Supported agents: `claude`, `codex`, `omp`, `pi`, `grok`. Others (including `hermes`) fail with a clear error. Adding one means adding an adapter class to the script.
 - The repo must have at least one git remote, so it can be matched on the target.
 - The agent must be at rest (idle or done), not mid-turn or waiting on an approval.
 - herdr's Codex integration doesn't record a session id. The script picks the newest Codex transcript for the agent's folder written since the agent started. If two Codex agents share a folder it stops and asks for `--session`.
