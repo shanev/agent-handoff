@@ -4,6 +4,10 @@
 
 Move a running coding-agent session to another machine and keep going there.
 
+![A Claude Code session handed off from a laptop to a Mac mini, then asked "where were we?" there](docs/agent-handoff-demo.gif)
+
+<sub>A real handoff from a laptop to a Mac mini, with the waits cut. [MP4 version](docs/agent-handoff-demo.mp4)</sub>
+
 Say you're working with Claude Code on your laptop and want the session to keep running on the Mac mini at home, or you're at the mini and want the laptop's session over here. Ask your agent to hand it off. It quits the agent, moves the conversation, the branch and your uncommitted changes, and resumes the same session in [herdr](https://herdr.dev) on the other machine. The repo can live at a different path there; it's matched by its git remote.
 
 - **Sessions it can move:** Claude Code, Codex, omp, pi and grok.
