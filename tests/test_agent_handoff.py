@@ -7,12 +7,13 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -553,6 +554,14 @@ class CommandLine(unittest.TestCase):
             with self.assertRaises(SystemExit), mock.patch.object(sys, "stderr", io.StringIO()):
                 self.main(*argv)
 
+    def test_self_and_wait_timeout(self):
+        args = self.main("send", "demo", "vega", "--self", "--wait-timeout", "60")["args"]
+        self.assertTrue(args.self_handoff)
+        self.assertEqual(args.wait_timeout, 60)
+        for value in ("0", "-1"):
+            with self.assertRaises(SystemExit), mock.patch.object(sys, "stderr", io.StringIO()):
+                self.main("send", "demo", "vega", "--wait-timeout", value)
+
     def test_send_needs_a_target_without_from(self):
         with self.assertRaises(SystemExit), mock.patch.object(sys, "stderr", io.StringIO()):
             self.main("send", "demo")
@@ -585,6 +594,222 @@ class CommandLine(unittest.TestCase):
         self.assertTrue(ok_line["ok"])
         self.assertFalse(err_line["ok"])
         self.assertIn("missing on target", err_line["error"])
+
+
+class SelfHandoff(TempDirTest):
+    def setUp(self):
+        super().setUp()
+        self.src, self.dst = self.tmp / "source", self.tmp / "target"
+        sh("git", "init", "-q", "-b", "main", str(self.src))
+        (self.src / "a.txt").write_text("initial\n")
+        sh("git", "add", "-A", cwd=self.src)
+        sh("git", "commit", "-qm", "init", cwd=self.src)
+        sh("git", "remote", "add", "origin", "https://github.com/o/r", cwd=self.src)
+        sh("git", "clone", "-q", str(self.src), str(self.dst))
+        self.primary = self.tmp / "session.jsonl"
+        self.primary.write_text("before final reply\n")
+        self.agent = {"pane_id": "w1:p1", "agent": "claude", "name": "demo",
+                      "cwd": str(self.src), "agent_status": "working",
+                      "agent_session": {"kind": "id", "value": "session"}}
+        self.proc = {"pid": 123, "cwd": str(self.src), "argv": ["claude"]}
+        self.args = CommandLine().main("send", "demo", "--here", "--dir", str(self.dst),
+                                       "--self", "--wait-timeout", "60", "--", "--model", "opus")["args"]
+        self.probe = {"repo": str(self.dst), "other_checkouts": [], "herdr_version": "0.8.0",
+                      "integration": "current", "home": str(self.tmp), "config_root": str(self.tmp / "cfg")}
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:p1"}))
+        self.find = stack.enter_context(mock.patch.object(ah, "find_agent", side_effect=lambda _: dict(self.agent)))
+        self.foreground = stack.enter_context(mock.patch.object(ah, "foreground", return_value=(self.proc, 123, 1)))
+        stack.enter_context(mock.patch.object(ah.ADAPTERS["claude"], "locate", return_value=(self.primary, [])))
+        stack.enter_context(mock.patch.object(ah, "herdr_version", return_value="0.8.0"))
+        self.remote = stack.enter_context(mock.patch.object(ah, "remote", side_effect=self.remote_step))
+        self.exit = stack.enter_context(mock.patch.object(ah, "exit_agent"))
+        self.restart = stack.enter_context(mock.patch.object(ah, "start_agent"))
+        self.copy = stack.enter_context(mock.patch.object(ah, "send_files", return_value=["session.jsonl"]))
+        self.herdr = stack.enter_context(mock.patch.object(ah, "herdr", side_effect=self.herdr_step))
+        stack.enter_context(mock.patch.object(ah, "wait_for_shell"))
+        self.payload = None
+
+    def remote_step(self, target, step, payload):
+        if step == "probe":
+            return self.probe
+        if step == "prepare":
+            return ah.step_prepare(payload)
+        if step == "cleanup-refs":
+            return ah.step_cleanup_refs(payload)
+        if step == "start":
+            return {"name": "demo", "pane_id": "w3:p1", "installed_integration": False,
+                    "trust_prompt": "none", "waiting_for_user": []}
+        raise AssertionError(step)
+
+    def herdr_step(self, *argv):
+        if argv[:2] == ("workspace", "create"):
+            return {"workspace": {"workspace_id": "w2"}, "root_pane": {"pane_id": "w2:p1"}}
+        if argv[:2] == ("pane", "run"):
+            command = shlex.split(argv[3])
+            self.payload = Path(command[-1])
+            self.assertEqual(command[-2], "--deferred")
+            self.assertEqual(Path(command[1]).read_bytes(), SCRIPT.read_bytes())
+            self.addCleanup(lambda: ah.shutil.rmtree(self.payload.parent, ignore_errors=True))
+            return {}
+        if argv[:2] == ("agent", "wait"):
+            self.agent["agent_status"] = "done"
+            return {}
+        if argv[:2] == ("workspace", "close"):
+            return {}
+        raise AssertionError(argv)
+
+    def defer(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            ah.cmd_send(self.args)
+        return json.loads(buf.getvalue())
+
+    def test_self_requires_opt_in(self):
+        self.args.self_handoff = False
+        with self.assertRaisesRegex(ah.HandoffError, "pass --self"):
+            ah.cmd_send(self.args)
+        self.exit.assert_not_called()
+        self.herdr.assert_not_called()
+
+    def test_busy_self_dry_run_never_waits_or_creates_helper(self):
+        self.args.self_handoff, self.args.dry_run = False, True
+        out = self.defer()
+        self.assertTrue(out["dry_run"])
+        self.herdr.assert_not_called()
+        self.exit.assert_not_called()
+
+    def test_preflight_error_does_not_create_helper(self):
+        self.remote.side_effect = ah.HandoffError("target unreachable")
+        with self.assertRaisesRegex(ah.HandoffError, "target unreachable"):
+            self.defer()
+        self.herdr.assert_not_called()
+        self.exit.assert_not_called()
+
+    def test_deferred_response_and_flags(self):
+        out = self.defer()
+        self.assertEqual((out["ok"], out["deferred"], out["pane"], out["attach"]), (True, True, "w2:p1", None))
+        payload = json.loads(self.payload.read_text())
+        self.assertEqual((payload["agent"], payload["session"], payload["agent_args"]),
+                         ("w1:p1", "session", ["--model", "opus"]))
+        self.assertTrue(payload["wait"])
+        self.assertFalse(payload["self_handoff"])
+        self.assertEqual(payload["wait_timeout"], 60)
+        self.exit.assert_not_called()
+        self.assertFalse(any(c.args[:2] == ("agent", "wait") for c in self.herdr.call_args_list))
+
+    def test_self_defers_even_when_caller_pane_id_is_stale(self):
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "old-workspace:old-pane"}):
+            out = self.defer()
+        self.assertTrue(out["deferred"])
+        self.exit.assert_not_called()
+        self.assertFalse(any(c.args[:2] == ("agent", "wait") for c in self.herdr.call_args_list))
+
+    def test_remote_attach_and_config_are_preserved(self):
+        self.args.target, self.args.here = "vega@vega", False
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.tmp / "custom cfg")}):
+            out = self.defer()
+        self.assertEqual(out["attach"], "herdr --remote vega@vega")
+        create = self.herdr.call_args_list[0].args
+        self.assertIn("--no-focus", create)
+        self.assertIn(f"CLAUDE_CONFIG_DIR={self.tmp / 'custom cfg'}", create)
+
+    def test_timeout_keeps_source_running_and_helper_open(self):
+        self.defer()
+        def timeout(*argv):
+            raise ah.HandoffError("timeout waiting for idle")
+        self.herdr.side_effect = timeout
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w2:p1"}), \
+             self.assertRaisesRegex(ah.HandoffError, "timeout"):
+            ah.run_deferred(self.payload)
+        self.exit.assert_not_called()
+        self.assertFalse(self.payload.parent.exists())
+        self.assertEqual(self.herdr.call_args.args,
+                         ("agent", "wait", "w1:p1", "--until", "idle", "--until", "done", "--timeout", "60000"))
+
+    def test_replaced_agent_is_never_exited(self):
+        self.defer()
+        self.foreground.return_value = ({**self.proc, "pid": 456}, 456, 1)
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w2:p1"}), \
+             self.assertRaisesRegex(ah.HandoffError, "changed while waiting"):
+            ah.run_deferred(self.payload)
+        self.exit.assert_not_called()
+        self.assertFalse(any(c.args[:2] == ("workspace", "close") for c in self.herdr.call_args_list))
+
+    def test_replaced_session_is_never_exited(self):
+        self.defer()
+        self.agent["agent_session"] = {"kind": "id", "value": "different-session"}
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w2:p1"}), \
+             self.assertRaisesRegex(ah.HandoffError, "changed while waiting"):
+            ah.run_deferred(self.payload)
+        self.exit.assert_not_called()
+
+    def test_deferred_command_reports_timeout_as_json(self):
+        self.defer()
+        self.herdr.side_effect = ah.HandoffError("timeout waiting for idle")
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w2:p1"}), \
+             mock.patch.object(sys, "argv", [str(SCRIPT), "--deferred", str(self.payload)]), \
+             redirect_stdout(buf), self.assertRaises(SystemExit) as error:
+            ah.main()
+        self.assertEqual(error.exception.code, 1)
+        self.assertEqual(json.loads(buf.getvalue()), {"ok": False, "error": "timeout waiting for idle"})
+        self.exit.assert_not_called()
+
+    def test_success_includes_final_edits_and_closes_helper(self):
+        self.defer()
+        def final_turn(pane, adapter):
+            (self.src / "last.txt").write_text("last turn edit\n")
+            self.primary.write_text("final reply\n")
+        self.exit.side_effect = final_turn
+        def copy_final(*args):
+            self.assertEqual(self.primary.read_text(), "final reply\n")
+            return ["session.jsonl"]
+        self.copy.side_effect = copy_final
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w2:p1"}), redirect_stdout(io.StringIO()):
+            ah.run_deferred(self.payload)
+        self.assertEqual((self.dst / "last.txt").read_text(), "last turn edit\n")
+        self.assertFalse((self.src / "last.txt").exists())
+        self.assertIn("agent-handoff", sh("git", "stash", "list", cwd=self.src))
+        self.herdr.assert_any_call("workspace", "close", "w2")
+        self.assertFalse(self.payload.parent.exists())
+
+    def test_failure_after_exit_restarts_source_and_leaves_helper_open(self):
+        self.defer()
+        def fail_prepare(target, step, payload):
+            if step == "prepare":
+                raise ah.HandoffError("target branch diverged")
+            return self.remote_step(target, step, payload)
+        self.remote.side_effect = fail_prepare
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w2:p1"}), \
+             self.assertRaisesRegex(ah.HandoffError, "diverged"):
+            ah.run_deferred(self.payload)
+        self.restart.assert_called_once_with("demo", "claude", "w1:p1", ["--resume", "session"])
+        self.assertFalse(any(c.args[:2] == ("workspace", "close") for c in self.herdr.call_args_list))
+
+    def test_local_new_worktree_survives_deferral(self):
+        self.args.dir, self.args.new_worktree = None, True
+        self.probe["repo"] = str(self.src)
+        self.defer()
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w2:p1"}), redirect_stdout(io.StringIO()):
+            ah.run_deferred(self.payload)
+        self.assertEqual(sh("git", "branch", "--list", "--format=%(refname:short)", "handoff/*", cwd=self.src),
+                         "handoff/session")
+
+    def test_helper_launch_failure_cleans_up(self):
+        original = self.herdr_step
+        def fail_run(*argv):
+            result = original(*argv)
+            if argv[:2] == ("pane", "run"):
+                raise ah.HandoffError("could not run command")
+            return result
+        self.herdr.side_effect = fail_run
+        with self.assertRaisesRegex(ah.HandoffError, "could not run"):
+            self.defer()
+        self.herdr.assert_any_call("workspace", "close", "w2")
+        self.assertFalse(self.payload.parent.exists())
+        self.exit.assert_not_called()
 
 
 class HermesScannerFriendly(unittest.TestCase):
