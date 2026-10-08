@@ -11,7 +11,7 @@ Move a running coding-agent session to another machine and keep going there.
 Say you're working with Claude Code on your laptop and want the session to keep running on the Mac mini at home, or you're at the mini and want the laptop's session over here. Ask your agent to hand it off. It quits the agent, moves the conversation, the branch and your uncommitted changes, and resumes the same session in [herdr](https://herdr.dev) on the other machine. The repo can live at a different path there; it's matched by its git remote.
 
 - **Sessions it can move:** Claude Code, Codex, omp, pi and grok.
-- **Agents that can do the moving:** any agent that supports [skills](https://skills.sh), such as Hermes, Claude Code, Codex, OpenClaw or pi. Usually it's a different agent, or another session of the same one, since an agent can't move itself.
+- **Agents that can do the moving:** any agent that supports [skills](https://skills.sh), such as Hermes, Claude Code, Codex, OpenClaw or pi. Supported agents can also move their own session after their current turn ends.
 
 ## Using it
 
@@ -25,6 +25,8 @@ Once the skill is installed, tell your agent what you want:
 
 > Move my hark Claude session into its own worktree.
 
+> Move yourself to vega once this turn ends.
+
 > What agents could I hand off right now?
 
 > Is vega set up for handoffs?
@@ -34,6 +36,8 @@ Your agent finds the session you mean and checks the other machine. If anything 
 > Moved **hark-claude** to vega. It's running in `/Users/vega/github.com/tensor-systems/hark` on `main`, with your two uncommitted files. Attach with `herdr --remote vega@vega`.
 
 Attach from wherever you are and carry on. The agent remembers the whole conversation. To bring it back, ask again, from either machine.
+
+When you ask an agent to move itself, it checks the target and opens a helper pane, then finishes its reply. The helper starts the move as soon as the agent goes idle, including its final reply and any edits from that turn. It waits up to 30 minutes by default; `--wait-timeout SECONDS` changes this maximum. The helper closes on success and stays open with the error on failure. If the wait times out, the source agent keeps running.
 
 A few things you might notice afterwards:
 
@@ -101,6 +105,8 @@ python3 $S list                                  # agents here
 python3 $S doctor vega@vega                      # check both machines
 python3 $S send hark-claude vega@vega --dry-run  # show the plan
 python3 $S send hark-claude vega@vega            # do it
+python3 $S send hark-claude vega@vega --self     # from inside that agent: defer until idle
+python3 $S send hark-claude vega@vega --self --wait-timeout 60  # wait at most one minute
 python3 $S send hark-claude --from vega@vega     # bring one back from vega
 python3 $S send hark-claude --here --new-worktree  # same machine, into a new worktree
 ```
@@ -112,6 +118,7 @@ Run `python3 $S send --help` for every option.
 - **macOS ⇄ macOS:** Claude Code 2.1 and Codex 0.160, between a MacBook and a Mac mini over Tailscale.
 - **macOS ⇄ Linux:** Claude Code, between a MacBook and an Ubuntu 24.04 server (x86_64, root, bash) over Tailscale SSH.
 - **One machine:** omp, pi 0.84 and grok 1.0.46 between two checkouts, plus the `--here` modes.
+- **Self-handoff:** Claude Code 2.1.293 on macOS between two disposable checkouts, including timeout, final-turn edits and conversation continuity, helper cleanup, and source restart after a dirty-target failure.
 - **Agents doing the moving:** Hermes, Claude Code and Codex, each asked in plain words with the skill installed and nothing else said about it. Codex asked for approval to run the script outside its sandbox, as described above.
 
 All of it with herdr 0.8.0 and 0.9.3, and zsh/bash/sh. CI runs the tests on Linux and macOS. Reports from other setups are welcome.

@@ -26,7 +26,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-VERSION = "0.4.6"
+VERSION = "0.4.7"
 RESULT_MARK = "AGENT_HANDOFF_RESULT:"
 HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "agent-handoff"
@@ -970,16 +970,90 @@ def run_from(host: str, argv: List[str]) -> None:
     sys.exit(rc)
 
 
+def defer_send(args, agent: dict, proc: Optional[dict], src_cwd: str,
+               handle: dict, target_repo: str, src_root: str) -> dict:
+    """Run a stable copy in its own terminal, outside the source agent's process tree."""
+    stage = Path(tempfile.mkdtemp(prefix="agent-handoff-"))
+    workspace = None
+    try:
+        script = stage / "agent_handoff.py"
+        shutil.copyfile(__file__, script)
+        local_worktree = args.target == LOCAL and os.path.realpath(target_repo) == os.path.realpath(src_root)
+        deferred = dict(vars(args), agent=agent["pane_id"], session=handle["value"],
+                        dir=None if local_worktree else target_repo,
+                        new_worktree=args.new_worktree or local_worktree,
+                        wait=True, self_handoff=False, dry_run=False,
+                        expected_kind=agent["agent"], expected_pid=(proc or {}).get("pid"),
+                        expected_session=agent.get("agent_session"))
+        create = ["workspace", "create", "--cwd", src_cwd,
+                  "--label", "agent-handoff helper", "--no-focus"]
+        for key in CONFIG_VARS:
+            value = os.environ.get(key) or LOGIN_ENV.get(key)
+            if value:
+                create += ["--env", f"{key}={value}"]
+        workspace = herdr(*create)
+        pane = workspace["root_pane"]["pane_id"]
+        deferred["helper_workspace"] = workspace["workspace"]["workspace_id"]
+        payload = stage / "send.json"
+        payload.write_text(json.dumps(deferred))
+        command = shlex.join([sys.executable, str(script), "--deferred", str(payload)])
+        wait_for_shell(pane, 20)
+        herdr("pane", "run", pane, command)
+    except Exception:
+        if workspace:
+            try:
+                herdr("workspace", "close", workspace["workspace"]["workspace_id"])
+            except HandoffError as e:
+                log(f"could not close helper workspace: {e}")
+        shutil.rmtree(stage)
+        raise
+    return {"ok": True, "deferred": True, "pane": pane,
+            "workspace": deferred["helper_workspace"], "target": args.target,
+            "attach": None if args.target == LOCAL else f"herdr --remote {args.target}"}
+
+
+def run_deferred(payload: Path) -> None:
+    args = argparse.Namespace(**json.loads(payload.read_text()))
+    try:
+        cmd_send(args)
+    finally:
+        # The shell keeps the error output even after this temporary copy is removed.
+        shutil.rmtree(payload.parent)
+    try:
+        herdr("workspace", "close", args.helper_workspace)
+    except HandoffError as e:
+        log(f"handoff succeeded, but could not close helper workspace: {e}")
+
+
 def cmd_send(args) -> None:
     agent = find_agent(args.agent)
     pane, kind = agent["pane_id"], agent["agent"]
-    if pane == os.environ.get("HERDR_PANE_ID"):
-        raise HandoffError("refusing to hand off the agent running this command; run it from another pane")
+    this_pane = pane == os.environ.get("HERDR_PANE_ID")
+    if this_pane and not args.self_handoff and not args.dry_run:
+        raise HandoffError("refusing to hand off the agent running this command; "
+                           "pass --self to move it after this turn ends")
+    deferred = hasattr(args, "helper_workspace")
+    if not args.self_handoff and not args.dry_run and (deferred or agent["agent_status"] in ("working", "blocked")):
+        if not args.wait:
+            raise HandoffError(f"{kind} in {pane} is {agent['agent_status']}; let it finish "
+                               f"(or rerun with --wait)")
+        log(f"waiting up to {args.wait_timeout}s for {pane} to go idle")
+        herdr("agent", "wait", pane, "--until", "idle", "--until", "done",
+              "--timeout", str(args.wait_timeout * 1000))
+        agent = find_agent(pane)
+        if agent["agent"] != kind:
+            raise HandoffError(f"the agent in {pane} changed while waiting; retry the handoff")
+        if agent["agent_status"] not in ("idle", "done"):
+            raise HandoffError(f"{kind} in {pane} is no longer idle; retry the handoff")
     adapter = adapter_for(kind)
     handle = agent.get("agent_session")
     if args.session:
         handle = {"kind": "path" if "/" in args.session else "id", "value": args.session}
     proc, _, _ = foreground(pane, adapter.binary)
+    if deferred and (kind != args.expected_kind
+                     or (args.expected_pid is not None and (proc or {}).get("pid") != args.expected_pid)
+                     or (args.expected_session and agent.get("agent_session") != args.expected_session)):
+        raise HandoffError(f"the agent in {pane} changed while waiting; retry the handoff")
     src_cwd = (proc or {}).get("cwd") or agent["cwd"]
     if not handle and proc:
         same_dir = [a for a in herdr("agent", "list")["agents"]
@@ -993,13 +1067,6 @@ def cmd_send(args) -> None:
         hint = (f"run `herdr integration install {kind}` and restart the agent"
                 if state != "current" else "pass --session <id-or-path>")
         raise HandoffError(f"herdr doesn't know {kind}'s session id in {pane}; {hint}")
-
-    if agent["agent_status"] in ("working", "blocked"):
-        if not args.wait:
-            raise HandoffError(f"{kind} in {pane} is {agent['agent_status']}; let it finish "
-                               f"(or rerun with --wait)")
-        log(f"waiting for {pane} to go idle")
-        herdr("agent", "wait", pane, "--until", "idle", "--until", "done", "--timeout", "1800000")
 
     src_root = git(src_cwd, "rev-parse", "--show-toplevel")
     rel = os.path.relpath(os.path.realpath(src_cwd), os.path.realpath(src_root))
@@ -1039,6 +1106,9 @@ def cmd_send(args) -> None:
             "target_integration": probe["integration"], "source_argv": (proc or {}).get("argv")}
     if args.dry_run:
         print(json.dumps({"dry_run": True, **plan}, indent=2))
+        return
+    if args.self_handoff:
+        print(json.dumps(defer_send(args, agent, proc, src_cwd, handle, probe["repo"], src_root), indent=2))
         return
 
     log(f"exiting {kind} in {pane}")
@@ -1135,6 +1205,13 @@ REMOTE_STEPS["doctor"] = step_doctor
 
 
 def main() -> None:
+    if len(sys.argv) == 3 and sys.argv[1] == "--deferred":
+        try:
+            run_deferred(Path(sys.argv[2]))
+        except HandoffError as e:
+            print(json.dumps({"ok": False, "error": str(e)}, indent=2))
+            sys.exit(1)
+        return
     if len(sys.argv) == 4 and sys.argv[1] == "--remote":
         remote_main(sys.argv[2], json.loads(sys.argv[3]))
         return
@@ -1162,6 +1239,10 @@ def main() -> None:
     s.add_argument("--keep-source-changes", action="store_true",
                    help="don't stash the source checkout's uncommitted changes after handoff")
     s.add_argument("--wait", action="store_true", help="wait for a working agent to go idle first")
+    s.add_argument("--self", dest="self_handoff", action="store_true",
+                   help="move the agent running this command via a helper pane after its turn ends")
+    s.add_argument("--wait-timeout", type=int, default=1800, metavar="SECONDS",
+                   help="maximum time to wait for idle with --wait or --self (default: 1800 seconds)")
     s.add_argument("--no-focus", action="store_true", help="don't focus the new workspace on the target")
     s.add_argument("--no-trust", action="store_true",
                    help="leave the agent's 'trust this folder?' prompt on the target for the user")
@@ -1174,6 +1255,8 @@ def main() -> None:
     extra = argv[argv.index("--") + 1:] if "--" in argv else []
     args = ap.parse_args(argv[:argv.index("--")] if "--" in argv else argv)
     args.agent_args = extra
+    if args.cmd == "send" and args.wait_timeout <= 0:
+        ap.error("--wait-timeout must be a positive number of seconds")
     if args.cmd == "send" and args.here:
         if args.target or args.from_host:
             ap.error("--here hands off on this machine; don't also give a target or --from")
