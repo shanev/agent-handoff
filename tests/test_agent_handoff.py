@@ -8,6 +8,7 @@ import io
 import json
 import os
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -112,6 +113,7 @@ class Adapters(unittest.TestCase):
         self.assertEqual(handle, "/home/b/.omp/agent/sessions/-code-r/2026_x.jsonl")
         self.assertIn(("sessions/-src-r/", "sessions/-code-r/"), pairs)
         self.assertEqual(ah.ADAPTERS["omp"].resume_args(handle), ["--resume", handle])
+        self.assertEqual(ah.ADAPTERS["omp"].exit_text, "/quit")
 
     def test_pi_place_and_resume(self):
         src = Path("/Users/a/.pi/agent/sessions/--Users-a-r--/2026_x.jsonl")
@@ -128,6 +130,22 @@ class Adapters(unittest.TestCase):
         self.assertEqual(mapping[str(src)], f"/home/b/.grok/sessions/%2Fhome%2Fb%2Fcode%2Fr/{sid}")
         self.assertIn(("/Users/a/.grok/", "/home/b/.grok/"), pairs)
         self.assertEqual(ah.ADAPTERS["grok"].resume_args(handle), ["--resume", sid])
+
+    def test_opencode_place_resume_and_import(self):
+        src = Path("/tmp/agent-handoff-opencode/ses_4f2a1c.json")
+        mapping, pairs, handle = ah.ADAPTERS["opencode"].place(
+            src, "/home/b/code/r", "/home/b", "/home/b/.local/share/opencode")
+        self.assertEqual(mapping[str(src)], "/home/b/.local/share/opencode/handoff/ses_4f2a1c.json")
+        self.assertEqual(pairs, [])
+        self.assertEqual(handle, "ses_4f2a1c")
+        self.assertEqual(ah.ADAPTERS["opencode"].resume_args(handle), ["--session", "ses_4f2a1c"])
+        prelude = ah.ADAPTERS["opencode"].prelude(handle, "/home/b/code/r", mapping)
+        self.assertEqual(prelude, [{
+            "cmd": "opencode --standalone session import "
+                   "/home/b/.local/share/opencode/handoff/ses_4f2a1c.json --directory /home/b/code/r",
+            "expect": r"Imported session:|Session already exists",
+        }])
+        self.assertEqual(ah.ADAPTERS["opencode"].exit_text, "/exit")
 
     def test_config_root_env_override(self):
         claude = ah.ADAPTERS["claude"]
@@ -195,6 +213,83 @@ class SessionLookup(TempDirTest):
             self.assertEqual(pi.locate({"kind": "id", "value": "01a10d2e"}, cwd)[0], pi_file)
             self.assertEqual(grok.guess_handle(cwd, time.time() - 60), {"kind": "id", "value": sid})
             self.assertEqual(grok.locate({"kind": "id", "value": sid}, cwd)[0], grok_sess)
+
+    def test_omp_guess_and_id_locate(self):
+        cwd = "/work/r"
+        root = self.tmp / "omp"
+        sess = root / "sessions" / ah.omp_session_dir(cwd, str(ah.HOME))
+        sess.mkdir(parents=True)
+        old = sess / "2020-01-01T00-00-00-000Z_01a10000-0000-0000-0000-000000000001.jsonl"
+        new = sess / "2026-10-05T17-49-00-374Z_01a10d2e-e856-758d-8fd7-750f4070e0fb.jsonl"
+        old.write_text("{}\n")
+        os.utime(old, (time.time() - 3600,) * 2)
+        new.write_text("{}\n")
+        (sess / new.stem).mkdir()
+        with mock.patch.dict(os.environ, {"PI_CODING_AGENT_DIR": str(root)}):
+            omp = ah.ADAPTERS["omp"]
+            self.assertEqual(omp.guess_handle(cwd, time.time() - 60), {"kind": "path", "value": str(new)})
+            primary, extras = omp.locate({"kind": "id", "value": "01a10d2e"}, cwd)
+        self.assertEqual(primary, new)
+        self.assertEqual(extras, [sess / new.stem])
+
+    def test_opencode_guess_uses_the_newest_session_for_this_directory(self):
+        cwd = "/work/r"
+        root = self.tmp / "opencode"
+        root.mkdir()
+        db = root / "opencode.db"
+        now = int(time.time() * 1000)
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE session_v2 (id TEXT, directory TEXT, parent_id TEXT, time_updated INTEGER)")
+        con.execute("CREATE TABLE session (id TEXT, directory TEXT, parent_id TEXT, time_updated INTEGER)")
+        con.executemany("INSERT INTO session_v2 VALUES (?,?,?,?)", [
+            ("ses_old", cwd, None, 0),
+            ("ses_child", cwd, "ses_new", now),
+            ("ses_other", "/work/other", None, now),
+            ("ses_new", cwd, None, now - 1000),
+        ])
+        # A legacy row must still be visible when it was never copied into session_v2.
+        con.execute("INSERT INTO session VALUES (?,?,?,?)", ("ses_legacy", cwd, None, now))
+        con.commit()
+        con.close()
+        with mock.patch.dict(os.environ, {"OPENCODE_DATA_DIR": str(root)}):
+            oc = ah.ADAPTERS["opencode"]
+            self.assertEqual(oc.guess_handle(cwd, time.time() - 60), {"kind": "id", "value": "ses_legacy"})
+            primary, extras = oc.locate({"kind": "id", "value": "ses_n"}, cwd)
+        self.assertEqual(primary.name, "ses_new.json")
+        self.assertEqual(extras, [])
+        with mock.patch.dict(os.environ, {"OPENCODE_DATA_DIR": str(root)}):
+            with self.assertRaisesRegex(ah.HandoffError, "full id"):
+                ah.ADAPTERS["opencode"].locate({"kind": "id", "value": "ses_"}, cwd)
+
+    def test_opencode_guess_reads_legacy_json_and_export_strips_status_text(self):
+        cwd = "/work/r"
+        root = self.tmp / "opencode-json"
+        sess = root / "storage" / "session" / "proj"
+        sess.mkdir(parents=True)
+        path = sess / "ses_json.json"
+        path.write_text(json.dumps({
+            "id": "ses_json", "directory": cwd,
+            "time": {"updated": int(time.time() * 1000)},
+        }))
+        (sess / "ses_child.json").write_text(json.dumps({
+            "id": "ses_child", "directory": cwd, "parentID": "ses_json",
+            "time": {"updated": int(time.time() * 1000)},
+        }))
+        with mock.patch.dict(os.environ, {"OPENCODE_DATA_DIR": str(root)}):
+            oc = ah.ADAPTERS["opencode"]
+            self.assertEqual(oc.guess_handle(cwd, time.time() - 60), {"kind": "id", "value": "ses_json"})
+            primary, _ = oc.locate({"kind": "id", "value": "ses_json"}, cwd)
+
+            def fake_run(cmd, cwd=None, input=None, check=True):
+                self.assertEqual(cmd, ["opencode", "session", "export", "ses_json"])
+                return 'Exporting session: ses_json\n{"info": {"id": "ses_json", "directory": "/work/r"}}\n'
+
+            with mock.patch.object(ah, "have", return_value=True), \
+                 mock.patch.object(ah, "run", side_effect=fake_run):
+                exported, extras = oc.capture({"kind": "id", "value": "ses_json"}, cwd, primary, [])
+        self.assertEqual(json.loads(exported.read_text())["info"]["id"], "ses_json")
+        self.assertEqual(extras, [])
+        ah.shutil.rmtree(exported.parent, ignore_errors=True)
 
     def test_local_transport_copies_without_ssh(self):
         src = self.tmp / "a" / "s.jsonl"
@@ -432,8 +527,14 @@ class TrustScreen(unittest.TestCase):
 › 1. Trust and continue
   2. Quit"""
 
-    def run_trust(self, kind, screen, accept=True):
-        screens = [screen] * 3 + ["❯ "]  # the screen goes away after the keys
+    GROK_SCREEN = """ Do you trust the contents of this directory?
+ /Users/someone/repo
+
+ Yes, proceed                 y
+ No, quit                     n"""
+
+    def run_trust(self, kind, screen, accept=True, screens=None):
+        screens = list(screens if screens is not None else [screen] * 3 + ["❯ "])
         keys = []
 
         def fake(*args):
@@ -461,6 +562,13 @@ class TrustScreen(unittest.TestCase):
         with mock.patch.object(ah, "hc_json", return_value={"text": "❯ "}), \
              mock.patch.object(ah.time, "sleep"):
             self.assertEqual(ah.answer_trust("t1", ah.ADAPTERS["claude"], True), "none")
+
+    def test_grok_presses_the_yes_key(self):
+        self.assertEqual(self.run_trust("grok", self.GROK_SCREEN), ("accepted", ["y"]))
+
+    def test_grok_trust_can_appear_after_a_blank_screen(self):
+        result, keys = self.run_trust("grok", self.GROK_SCREEN, screens=["\n\n", "", self.GROK_SCREEN, "ready"])
+        self.assertEqual((result, keys), ("accepted", ["y"]))
 
 
 class UserScreens(unittest.TestCase):
@@ -864,6 +972,10 @@ class HcRuntime(unittest.TestCase):
         self.assertEqual(ah.launch_line("codex", ["--no-daemon", "resume", "abc"]),
                          "codex --no-daemon resume abc")
         self.assertEqual(ah.launch_line("claude", ["--resume", "abc"]), "claude --resume abc")
+        self.assertEqual(ah.launch_line("opencode", ["--session", "ses_a"]),
+                         "opencode --standalone --session ses_a")
+        self.assertEqual(ah.launch_line("opencode", ["--standalone", "--session", "ses_a"]),
+                         "opencode --standalone --session ses_a")
 
     def test_down_server_is_an_error(self):
         with mock.patch.object(ah, "have", return_value=True), \
@@ -892,16 +1004,69 @@ class HcRuntime(unittest.TestCase):
         with mock.patch.object(ah, "hc_json", side_effect=fake), \
              mock.patch.object(ah, "wait_for_shell"), \
              mock.patch.object(ah, "answer_trust", return_value="none"), \
+             mock.patch.object(ah, "show_in_app", return_value=None), \
              mock.patch.object(ah.time, "sleep"):
             started = ah.step_start({"kind": "claude", "name": "demo", "cwd": "/repo",
                                      "args": ["--resume", "sid"], "trust": True})
         self.assertEqual(started["pane_id"], "t4")
+        self.assertIsNone(started["app"])
         run = next(c for c in calls if c[0] == "run")
         self.assertIn("--no-parent", run)
         self.assertIn("--outlive-parent", run)
         self.assertNotIn("--no-focus", run)
         sent = next(c for c in calls if c[0] == "send")
         self.assertEqual(sent[-1], "claude --resume sid")
+
+    def test_start_imports_before_resuming_opencode(self):
+        calls = []
+
+        def fake(*args):
+            calls.append(args)
+            if args[0] == "ls":
+                return {"terminals": []}
+            if args[0] == "run":
+                return {"address": "t4", "name": "demo"}
+            if args[0] == "get":
+                return {"state": "live", "pid": 3, "status": {"app": "opencode", "state": "idle"},
+                        "foreground": {"pid": 9, "name": "opencode", "argv": ["opencode"], "cwd": "/repo"}}
+            if args[0] == "send":
+                return {}
+            if args[0] == "read":
+                return {"text": "Imported session: ses_a\n$"}
+            raise AssertionError(args)
+
+        prelude = [{"cmd": "opencode --standalone session import /repo/ses_a.json --directory /repo",
+                    "expect": r"Imported session:|Session already exists"}]
+        with mock.patch.object(ah, "hc_json", side_effect=fake), \
+             mock.patch.object(ah, "wait_for_shell"), \
+             mock.patch.object(ah, "answer_trust", return_value="none"), \
+             mock.patch.object(ah, "show_in_app", return_value=None), \
+             mock.patch.object(ah.time, "sleep"):
+            ah.step_start({"kind": "opencode", "name": "demo", "cwd": "/repo", "trust": True,
+                           "prelude": prelude, "args": ["--session", "ses_a"]})
+        sent = [c[-1] for c in calls if c[0] == "send"]
+        self.assertEqual(sent, [prelude[0]["cmd"], "opencode --standalone --session ses_a"])
+
+    def test_start_stops_when_the_import_does_not_confirm(self):
+        def fake(*args):
+            if args[0] == "ls":
+                return {"terminals": []}
+            if args[0] == "run":
+                return {"address": "t4", "name": "demo"}
+            if args[0] == "get":
+                return {"state": "live", "pid": 3, "foreground": {"pid": 3, "name": "zsh", "argv": ["zsh"]}}
+            if args[0] in ("send", "read", "kill", "rm"):
+                return {"text": "Failed to import session: no such file"}
+            raise AssertionError(args)
+
+        with mock.patch.object(ah, "hc_json", side_effect=fake), \
+             mock.patch.object(ah, "wait_for_shell"), \
+             mock.patch.object(ah.time, "sleep"):
+            with self.assertRaisesRegex(ah.HandoffError, "did not finish"):
+                ah.step_start({"kind": "opencode", "name": "demo", "cwd": "/repo", "trust": True,
+                               "prelude": [{"cmd": "opencode session import /missing.json",
+                                            "expect": "Imported session:"}],
+                               "args": ["--session", "ses_a"]})
 
     def test_self_handoff_helper_outlives_the_source(self):
         calls = []
@@ -935,6 +1100,70 @@ class HcRuntime(unittest.TestCase):
         body = json.loads(ah.Path(payload).read_text())
         self.assertTrue(body["deferred_helper"])
         self.assertIn("|| exec", wrapper)
+
+
+class TerminalNames(unittest.TestCase):
+    def test_other_machines_do_not_take_a_local_name(self):
+        listed = {"terminals": [
+            {"name": "demo", "address": "vega/t1"},
+            {"name": "other", "address": "t2"},
+        ]}
+        with mock.patch.object(ah, "hc_json", return_value=listed):
+            self.assertEqual(ah.unique_terminal_name("demo"), "demo")
+            self.assertEqual(ah.unique_terminal_name("other"), "other-2")
+
+
+class AppPlacement(unittest.TestCase):
+    def place(self, responses):
+        calls = []
+
+        def fake(*args):
+            calls.append(args)
+            key = args[1] if args[0] == "do" else args[0]
+            return responses[key]
+
+        with mock.patch.object(ah, "herdr_app", side_effect=fake):
+            shown = ah.show_in_app("t9", "demo", "/repo")
+        return shown, calls
+
+    def test_new_space_keeps_the_terminal_and_drops_the_shell_tab(self):
+        shown, calls = self.place({
+            "ls": {"spaces": [{"id": "sp-else", "name": "else", "folder": "/elsewhere", "machine": None},
+                              {"id": "sp-remote", "name": "remote", "folder": "/repo", "machine": "vega"}]},
+            "space.new": {"space": "sp-new", "tab": "tb-shell", "terminal": "t-shell"},
+            "terminal.keep": {"pending": True, "terminal": "t9", "pane": "p1", "tab": "tb-agent"},
+            "tab.close": {"ok": True},
+        })
+        self.assertEqual(shown, {"space": "demo", "tab": "tb-agent"})
+        self.assertIn(("do", "space.new", "--name", "demo", "--folder", "/repo",
+                       "--machine", "", "--focus", "true"), calls)
+        self.assertIn(("do", "terminal.keep", "--terminal", "t9", "--place", "tab"), calls)
+        self.assertIn(("do", "tab.close", "--id", "tb-shell", "--confirmed", "true"), calls)
+
+    def test_existing_space_for_the_folder_is_reused(self):
+        shown, calls = self.place({
+            "ls": {"spaces": [{"id": "sp-repo", "name": "repo", "folder": "/repo", "machine": None}]},
+            "space.select": {"ok": True},
+            "terminal.keep": {"tab": "tb-agent", "pane": "p1"},
+        })
+        self.assertEqual(shown, {"space": "repo", "tab": "tb-agent"})
+        self.assertIn(("do", "space.select", "--id", "sp-repo"), calls)
+        self.assertNotIn("space.new", [c[1] for c in calls if c[0] == "do"])
+        self.assertNotIn("tab.close", [c[1] for c in calls if c[0] == "do"])
+
+    def test_a_failed_keep_removes_the_space_it_just_made(self):
+        shown, calls = self.place({
+            "ls": {"spaces": []},
+            "space.new": {"space": "sp-new", "tab": "tb-shell", "terminal": "t-shell"},
+            "terminal.keep": {"error": "no such terminal"},
+            "space.close": {"ok": True},
+        })
+        self.assertIsNone(shown)
+        self.assertIn(("do", "space.close", "--id", "sp-new", "--confirmed", "true"), calls)
+
+    def test_missing_app_leaves_the_terminal_alone(self):
+        with mock.patch.object(ah, "have", return_value=False):
+            self.assertIsNone(ah.show_in_app("t9", "demo", "/repo"))
 
 
 class HermesScannerFriendly(unittest.TestCase):

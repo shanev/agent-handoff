@@ -1,13 +1,13 @@
 ---
 name: agent-handoff
-description: "Move a running coding-agent session (Claude Code, Codex, omp, pi, grok) from one machine to another over SSH, with its transcript, branch and uncommitted changes, and resume it in an hc terminal on the target. Use when the user asks to hand off, move, transfer, or continue an agent session on another machine/host (e.g. 'move the hark claude to vega'), or on this machine into another checkout or its own worktree. Requires hc on both machines."
-version: 0.6.0
+description: "Move a running coding-agent session (Claude Code, Codex, omp, pi, grok, OpenCode) from one machine to another over SSH, with its transcript, branch and uncommitted changes, and resume it in an hc terminal on the target. Use when the user asks to hand off, move, transfer, or continue an agent session on another machine/host (e.g. 'move the hark claude to vega'), or on this machine into another checkout or its own worktree. Requires hc on both machines."
+version: 0.6.2
 author: Shane Vitarana
 license: MIT
 platforms: [macos, linux]
 metadata:
   hermes:
-    tags: [Coding-Agent, hc, Handoff, Claude, Codex, omp, pi, grok, SSH, Tailscale]
+    tags: [Coding-Agent, hc, Handoff, Claude, Codex, omp, pi, grok, OpenCode, SSH, Tailscale]
     related_skills: [claude-code, codex]
 ---
 
@@ -17,13 +17,13 @@ Moves a coding agent that is running in an hc terminal on this machine to anothe
 
 One handoff does all of this:
 
-1. Finds the agent. It is a live terminal (`hc ls`: name or address such as `t7`, kind `claude-code`, `codex`, `omp`, `pi` or `grok`). hc does not record a session id, so the script uses the newest transcript for that folder written since the agent process started.
+1. Finds the agent. It is a live terminal (`hc ls`: name or address such as `t7`, kind `claude-code`, `codex`, `omp`, `pi`, `grok` or `opencode`). hc does not record a session id, so the script uses the newest transcript for that folder written since the agent process started.
 2. Checks the target over ssh: tools present, `hc server` up, and **a checkout of the same repo** — matched by git remote, so it may live at a different path.
 3. Quits the agent cleanly (`/exit` or `/quit`), so nothing else writes to the transcript.
 4. Pushes `HEAD` plus a snapshot of uncommitted changes **straight to the target over ssh** (`refs/handoff/*`, removed afterwards). Nothing is pushed to GitHub, and no branch on either side is rewritten.
 5. On the target: fast-forwards the branch where it is already checked out, or else makes a worktree next to the repo (`<repo>.worktrees/<branch>`), then applies the uncommitted changes.
-6. Copies the transcript into the target agent's session store (honouring `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `PI_CODING_AGENT_DIR` and `GROK_HOME` on either side), replacing the old repo path, home directory and config folder with the new ones inside it.
-7. Resumes the agent in a new terminal (`hc run` a shell, then the resume command). Codex is started with `--no-daemon`, because otherwise its commands run outside the terminal. If the agent asks whether to trust the folder, the script answers yes: the user was already working in this repo on the source. Pass `--no-trust` to leave that question for the user.
+6. Copies the transcript into the target agent's session store (honouring `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `PI_CODING_AGENT_DIR`, `GROK_HOME` and `OPENCODE_DATA_DIR` on either side), replacing the old repo path, home directory and config folder with the new ones inside it. OpenCode keeps every session in one database, so this step exports that session to JSON and imports it into the target directory.
+7. Resumes the agent in a new terminal (`hc run` a shell, then the resume command). Codex is started with `--no-daemon`, and OpenCode with `--standalone`, because otherwise their commands run outside the terminal. If the agent asks whether to trust the folder, the script answers yes: the user was already working in this repo on the source. Pass `--no-trust` to leave that question for the user. When the Herdr app is running on the target, the terminal is given a pane in the space for that folder (a new space if there isn't one), so it shows in the window.
 8. Stashes the uncommitted changes in the source checkout (`git stash list` shows them), so a later handoff back applies cleanly.
 
 If anything fails after step 3, including the agent exiting straight after it starts on the target, the script restarts the agent where it was and reports why.
@@ -66,7 +66,7 @@ If this is the first handoff to a machine, run `doctor <ssh-target>` first. Repo
    - `target_repo` is the checkout you expected. If `other_target_checkouts` lists others and it's not obvious, ask, then pass `--dir <path>`.
    - `source_argv` shows how the agent was started. If it had flags the user will want kept (model, permission mode), pass them after `--`, e.g. `send hark vega@vega -- --model opus`.
 4. If another agent is `working`, tell the user, and only pass `--wait` if they want to wait for it to finish its turn. Dry runs check the plan immediately, even while an agent is working.
-5. Run `send`. Report the target worktree, branch, whether uncommitted changes moved, and the `attach` line: `hc attach <name>` on this machine, `hc attach <machine>/<name>` when the target is in `hc machine ls`, or `ssh -t <target> hc attach <name>` otherwise. For yourself, use `send … --self`: it checks the plan and starts a helper terminal, then returns immediately. When `deferred` is true, finish your reply with "Moving to <target> once this turn ends" and the `attach` line, then end the turn. The helper waits for idle, quits you, and completes the move. Uncommitted changes and the transcript are captured after you quit, including edits and your final reply from this turn. The helper closes on success; on failure it stays open showing the error, and restarts you in place if you had already quit.
+5. Run `send`. Report the target worktree, branch, whether uncommitted changes moved, and the `attach` line: `hc attach <name>` on this machine, `hc attach <machine>/<name>` when the target is in `hc machine ls`, or `ssh -t <target> hc attach <name>` otherwise. When `target_app` names a space, the session is already showing there in the Herdr app; tell the user that space. For yourself, use `send … --self`: it checks the plan and starts a helper terminal, then returns immediately. When `deferred` is true, finish your reply with "Moving to <target> once this turn ends" and the `attach` line, then end the turn. The helper waits for idle, quits you, and completes the move. Uncommitted changes and the transcript are captured after you quit, including edits and your final reply from this turn. The helper closes on success; on failure it stays open showing the error, and restarts you in place if you had already quit.
 6. If `target_waiting_for_user` is not empty, the agent on the target is showing a screen the user must answer, and the script never answers these. Tell the user what it is, and don't send the agent prompts until they've dealt with it (a prompt's Enter would land on that screen):
    - `hook_review`: Codex wants approval for a new or changed hook. Escape skips it, and hooks then don't run. The handoff does not install a hook.
    - `first_run_setup` / `login`: the agent has never been set up, or isn't logged in, on the target. The session is copied over and will resume once the user attaches, finishes setup and logs in.
@@ -107,7 +107,7 @@ Checkouts are matched by any git remote (`git@github.com:o/r.git` and `https://g
 
 ## Limits
 
-- Supported agents: `claude`, `codex`, `omp`, `pi`, `grok`. Others (including `hermes`) fail with a clear error. Adding one means adding an adapter class to the script.
+- Supported agents: `claude`, `codex`, `omp`, `pi`, `grok`, `opencode`. Others (including `hermes`) fail with a clear error. Adding one means adding an adapter class to the script.
 - The repo must have at least one git remote, so it can be matched on the target.
 - The agent must be at rest (idle or done) before it quits. `--wait` and `--self` wait for that state; they do not answer approvals. `blocked` is not idle: the user still has to answer the screen.
 - hc does not record session ids. The script picks the newest transcript for the agent's folder written since the agent process started. If two agents of that kind share a folder it stops and asks for `--session`.

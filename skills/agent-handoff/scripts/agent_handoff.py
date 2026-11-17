@@ -18,6 +18,7 @@ import re
 import shlex
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -27,7 +28,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-VERSION = "0.6.0"
+VERSION = "0.6.2"
 RESULT_MARK = "AGENT_HANDOFF_RESULT:"
 HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "agent-handoff"
@@ -111,7 +112,7 @@ def require_hc() -> None:
 
 # hc `ls` labels agents with these words. Shells and other programs are not agents.
 HC_KINDS = {"claude-code": "claude", "claude": "claude", "codex": "codex",
-            "omp": "omp", "pi": "pi", "grok": "grok"}
+            "omp": "omp", "pi": "pi", "grok": "grok", "opencode": "opencode"}
 SHELLS = {"sh", "bash", "zsh", "fish", "nu", "pwsh", "powershell", "cmd", "dash", "elvish"}
 
 
@@ -177,7 +178,8 @@ def log(msg: str) -> None:
     print(f"agent-handoff: {msg}", file=sys.stderr, flush=True)
 
 
-CONFIG_VARS = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR", "GROK_HOME")
+CONFIG_VARS = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR", "GROK_HOME",
+               "OPENCODE_DATA_DIR", "OPENCODE_DB", "XDG_DATA_HOME")
 
 
 def adopt_login_path() -> None:
@@ -285,6 +287,8 @@ class Adapter:
     kind = ""
     binary = ""
     exit_text = "/exit"
+    # Flags the resumed process needs so its work stays in the hc terminal.
+    launch_flags: Tuple[str, ...] = ()
     # Where the agent keeps sessions: $<config_var> if set, else ~/<default_root>.
     config_var: Optional[str] = None
     default_root = ""
@@ -322,6 +326,16 @@ class Adapter:
 
     def resume_args(self, dst_handle: str) -> List[str]:
         raise NotImplementedError
+
+    def capture(self, handle: dict, src_cwd: str, primary: Path, extras: List[Path]
+                ) -> Tuple[Path, List[Path]]:
+        """The files to copy, after the agent has quit. Default: what locate found."""
+        return primary, extras
+
+    def prelude(self, dst_handle: str, dst_cwd: str, mapping: Dict[str, str]) -> List[dict]:
+        """Commands to run in the target shell before the agent. Each is
+        {"cmd": line, "expect": regex that must show up}, expect optional."""
+        return []
 
 
 def newest_since(files, started_at: float) -> Optional[Path]:
@@ -379,6 +393,7 @@ CODEX_ID = r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
 class Codex(Adapter):
     kind = binary = "codex"
     exit_text = "/quit"
+    launch_flags = ("--no-daemon",)  # the daemon runs commands outside the terminal
     config_var, default_root = "CODEX_HOME", ".codex"
     trust_marker = r"Trust this folder\?"
     trust_yes = r"Trust and continue"
@@ -428,17 +443,35 @@ class Codex(Adapter):
 
 
 class Omp(Adapter):
+    """One jsonl plus a sibling directory per session, under sessions/<cwd-dir>/.
+    `omp --resume` takes that path or an id prefix. Quit is `/quit`."""
     kind = binary = "omp"
-    default_root = ".omp/agent"
+    exit_text = "/quit"
+    # omp reads the same variable pi does; unset, its sessions are ~/.omp/agent.
+    config_var, default_root = "PI_CODING_AGENT_DIR", ".omp/agent"
 
     def locate(self, handle, src_cwd):
-        if handle["kind"] != "path":
-            raise HandoffError("omp sessions are files, not ids; pass --session <path>")
-        primary = Path(handle["value"])
+        if handle["kind"] == "path":
+            primary = Path(handle["value"])
+        else:  # id prefix, as `omp --resume` accepts
+            hits = [f for root in self.source_roots()
+                    for f in sorted((root / "sessions").glob(f"*/*{handle['value']}*.jsonl"))]
+            if not hits:
+                raise HandoffError(f"no omp session matching {handle['value']}")
+            in_cwd = [f for f in hits if f.parent.name == omp_session_dir(src_cwd, str(HOME))]
+            primary = (in_cwd or hits)[-1]
         if not primary.exists():
             raise HandoffError(f"omp session file {primary} does not exist")
         sibling = primary.with_suffix("")
         return primary, [sibling] if sibling.exists() else []
+
+    def guess_handle(self, src_cwd, started_at):
+        for root in self.source_roots():
+            f = newest_since((root / "sessions" / omp_session_dir(src_cwd, str(HOME))).glob("*.jsonl"),
+                             started_at)
+            if f:
+                return {"kind": "path", "value": str(f)}
+        return None
 
     def place(self, primary, dst_cwd, dst_home, dst_root):
         src_dir, dst_dir = primary.parent.name, omp_session_dir(dst_cwd, dst_home)
@@ -501,10 +534,12 @@ def grok_session_dir(cwd: str) -> str:
 
 class Grok(Adapter):
     """Each session is a directory: <GROK_HOME>/sessions/<url-encoded cwd>/<uuid>/.
-    grok has no folder-trust screen (its trust is opt-in, for hooks only)."""
+    A directory grok has not seen asks to trust its contents; `y` accepts."""
     kind = binary = "grok"
     config_var, default_root = "GROK_HOME", ".grok"
     verbatim = ("rewind_points.jsonl",)  # snapshots of the user's files
+    trust_marker = r"trust the contents of this directory"
+    trust_yes = r"Yes, proceed"
 
     def locate(self, handle, src_cwd):
         sid = handle["value"] if handle["kind"] == "id" else Path(handle["value"]).name
@@ -535,7 +570,208 @@ class Grok(Adapter):
         return ["--resume", dst_handle]
 
 
-ADAPTERS: Dict[str, Adapter] = {a.kind: a for a in (Claude(), Codex(), Omp(), Pi(), Grok())}
+def epoch_ms(value) -> float:
+    """Session timestamps are milliseconds. A value small enough to be seconds
+    (older files) is scaled up."""
+    try:
+        n = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if 0 < n < 1_000_000_000_000:
+        n *= 1000
+    return n
+
+
+def same_directory(a: str, b: str) -> bool:
+    return bool(a and b and os.path.realpath(a) == os.path.realpath(b))
+
+
+def json_object(text: str) -> str:
+    """The first JSON object in text. `opencode session export` has printed a
+    status line ahead of the object in some versions."""
+    start = text.find("{")
+    if start < 0:
+        raise HandoffError("opencode export did not return a JSON session")
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text[start:])
+    except json.JSONDecodeError as e:
+        raise HandoffError(f"opencode export did not return a JSON session: {e}")
+    if not isinstance(obj, dict):
+        raise HandoffError("opencode export did not return a JSON session")
+    return json.dumps(obj)
+
+
+class OpenCode(Adapter):
+    """Sessions live in sqlite (`session_v2` in opencode.db), keyed by directory.
+    After the agent quits, `opencode session export` writes one JSON file; the
+    target imports it, then resumes with `--standalone` so tools stay in the terminal.
+    A comma-separated OPENCODE_DATA_DIR is several roots; the first is where the
+    export file is written on the target."""
+    kind = binary = "opencode"
+    config_var, default_root = "OPENCODE_DATA_DIR", ".local/share/opencode"
+    launch_flags = ("--standalone",)
+
+    def config_root(self, env):
+        custom = (env.get(self.config_var) or "").split(",")[0].strip()
+        if custom:
+            return Path(custom).expanduser()
+        xdg = (env.get("XDG_DATA_HOME") or "").strip()
+        if xdg:
+            return Path(xdg).expanduser() / "opencode"
+        return HOME / self.default_root
+
+    def _env(self, key: str) -> str:
+        return os.environ.get(key) or LOGIN_ENV.get(key) or ""
+
+    def source_roots(self):
+        # An explicit data dir is the only place this opencode looks. Otherwise
+        # try the usual directories; the first one with the session wins.
+        custom = self._env("OPENCODE_DATA_DIR").strip()
+        if custom:
+            return [Path(part.strip()).expanduser() for part in custom.split(",") if part.strip()]
+        roots = [self.config_root({k: os.environ.get(k, "") for k in CONFIG_VARS}),
+                 HOME / "Library/Application Support/opencode"]
+        return [r for i, r in enumerate(roots) if r not in roots[:i]]
+
+    def _databases(self, roots: List[Path]) -> List[Path]:
+        db = self._env("OPENCODE_DB").strip()
+        if db == ":memory:":
+            return []
+        if db:
+            return [Path(db).expanduser()]
+        found: List[Path] = []
+        for root in roots:
+            found.append(root / "opencode.db")
+            if root.is_dir():
+                found.extend(sorted(root.glob("opencode-*.db")))
+        return found
+
+    def _session_rows(self, roots: Optional[List[Path]] = None) -> List[Tuple[str, str, float]]:
+        """(id, directory, updated ms) from sqlite and from legacy session JSON."""
+        roots = self.source_roots() if roots is None else roots
+        rows: List[Tuple[str, str, float]] = []
+        seen = set()
+
+        def add(sid: str, directory: str, updated, parent) -> None:
+            if not sid or parent or sid in seen:
+                return
+            seen.add(sid)
+            rows.append((sid, directory or "", epoch_ms(updated)))
+
+        for db in self._databases(roots):
+            if not db.is_file():
+                continue
+            try:
+                con = sqlite3.connect("file:" + urllib.parse.quote(str(db)) + "?mode=ro", uri=True)
+            except sqlite3.Error:
+                continue
+            try:
+                tables = {r[0] for r in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
+                for table in ("session_v2", "session"):
+                    if table not in tables:
+                        continue
+                    cols = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+                    if not {"id", "directory"} <= cols:
+                        continue
+                    updated = "time_updated" if "time_updated" in cols else "0"
+                    parent = "parent_id" if "parent_id" in cols else "NULL"
+                    for sid, directory, stamp, parent_id in con.execute(
+                            f"SELECT id, directory, {updated}, {parent} FROM {table}"):
+                        add(sid, directory, stamp, parent_id)
+            except sqlite3.Error:
+                continue
+            finally:
+                con.close()
+        # OPENCODE_DB is the whole store; the JSON files next to it are not a second copy.
+        if not self._env("OPENCODE_DB").strip():
+            for root in roots:
+                base = root / "storage" / "session"
+                files = list(base.glob("*/*.json")) if base.is_dir() else []
+                project = root / "project"
+                if project.is_dir():
+                    files.extend(project.glob("*/storage/session/*/*.json"))
+                for path in files:
+                    try:
+                        data = json.loads(path.read_text())
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    if not isinstance(data, dict):
+                        continue
+                    updated = (data.get("time") or {}).get("updated")
+                    if not updated:
+                        updated = path.stat().st_mtime
+                    add(data.get("id") or path.stem, data.get("directory") or "", updated,
+                        data.get("parentID") or data.get("parent_id"))
+        return rows
+
+    def _resolve_id(self, value: str) -> str:
+        rows = self._session_rows()
+        exact = [sid for sid, _, _ in rows if sid == value]
+        if exact:
+            return exact[0]
+        hits = [sid for sid, _, _ in rows if sid.startswith(value)]
+        if len(hits) == 1:
+            return hits[0]
+        where = ", ".join(str(r) for r in self.source_roots())
+        if not hits:
+            raise HandoffError(f"no OpenCode session matching {value} under {where}")
+        raise HandoffError(f"{len(hits)} OpenCode sessions match {value}; "
+                           f"pass --session with the full id")
+
+    def locate(self, handle, src_cwd):
+        sid = self._resolve_id(handle["value"] if handle["kind"] == "id" else Path(handle["value"]).stem)
+        # capture() replaces this with the export after the agent quits.
+        return self.config_root({k: os.environ.get(k, "") for k in CONFIG_VARS}) / "handoff" / f"{sid}.json", []
+
+    def _best_session(self, rows, src_cwd: str, started_ms: float) -> Optional[dict]:
+        best = None
+        for sid, directory, updated in rows:
+            if updated < started_ms or not same_directory(directory, src_cwd):
+                continue
+            if best is None or updated >= best[0]:
+                best = (updated, sid)
+        return {"kind": "id", "value": best[1]} if best else None
+
+    def guess_handle(self, src_cwd, started_at):
+        started_ms = started_at * 1000
+        # The database override replaces every data dir.
+        if self._env("OPENCODE_DB").strip() not in ("", ":memory:"):
+            return self._best_session(self._session_rows(), src_cwd, started_ms)
+        for root in self.source_roots():
+            found = self._best_session(self._session_rows([root]), src_cwd, started_ms)
+            if found:
+                return found
+        return None
+
+    def capture(self, handle, src_cwd, primary, extras):
+        if not have("opencode"):
+            raise HandoffError("opencode is not installed here, so its session can't be exported")
+        sid = primary.stem
+        out_dir = Path(tempfile.mkdtemp(prefix="agent-handoff-opencode-"))
+        out = out_dir / f"{sid}.json"
+        try:
+            text = run(["opencode", "session", "export", sid], cwd=src_cwd)
+            out.write_text(json_object(text))
+        except Exception:
+            shutil.rmtree(out_dir, ignore_errors=True)
+            raise
+        return out, []
+
+    def place(self, primary, dst_cwd, dst_home, dst_root):
+        return ({str(primary): f"{dst_root}/handoff/{primary.name}"}, [], primary.stem)
+
+    def resume_args(self, dst_handle):
+        return ["--session", dst_handle]
+
+    def prelude(self, dst_handle, dst_cwd, mapping):
+        dest = next(iter(mapping.values()))
+        cmd = shlex.join([self.binary, "--standalone", "session", "import", dest,
+                          "--directory", dst_cwd])
+        return [{"cmd": cmd, "expect": r"Imported session:|Session already exists"}]
+
+
+ADAPTERS: Dict[str, Adapter] = {a.kind: a for a in (Claude(), Codex(), Omp(), Pi(), Grok(), OpenCode())}
 
 
 def adapter_for(kind: str) -> Adapter:
@@ -715,13 +951,29 @@ def wait_until_idle(pane: str, timeout: float, binary: str) -> None:
 
 
 def answer_trust(pane: str, adapter: Adapter, accept: bool) -> str:
-    """Returns 'none' (no prompt), 'accepted', or 'pending' (left for the user)."""
+    """Returns 'none' (no prompt), 'accepted', or 'pending' (left for the user).
+
+    A trust screen is either a menu (a cursor on one row, Enter confirms) or a
+    single key named at the end of the yes row, such as grok's `y`."""
     if not adapter.trust_marker:
         return "none"
-    for _ in range(8):
+    screen = ""
+    previous = None
+    stable = 0
+    for _ in range(20):
         screen = read_screen(pane)
         if re.search(adapter.trust_marker, screen):
             break
+        # The prompt shows up after the TUI draws. A screen that has settled on
+        # something else will not become it; a blank one might.
+        text = "\n".join(ln.strip() for ln in screen.splitlines() if ln.strip())
+        if text and text == previous:
+            stable += 1
+            if stable >= 2:
+                return "none"
+        else:
+            previous = text
+            stable = 0
         time.sleep(0.5)
     else:
         return "none"
@@ -729,10 +981,15 @@ def answer_trust(pane: str, adapter: Adapter, accept: bool) -> str:
         return "pending"
     lines = screen.splitlines()
     cursor = next((i for i, l in enumerate(lines) if re.match(r"\s*[❯›>]\s", l)), None)
-    yes = next((i for i, l in enumerate(lines) if re.search(adapter.trust_yes or "", l)), None)
-    if cursor is None or yes is None:
+    yes_at = next((i for i, l in enumerate(lines) if re.search(adapter.trust_yes or "", l)), None)
+    yes_line = lines[yes_at] if yes_at is not None else ""
+    key = re.search(r"(?:^|\s)([a-zA-Z])\s*$", yes_line)
+    if cursor is not None and yes_at is not None:
+        keys = ["down" if yes_at > cursor else "up"] * abs(yes_at - cursor) + ["enter"]
+    elif key:
+        keys = [key.group(1).lower()]
+    else:
         return "pending"
-    keys = ["down" if yes > cursor else "up"] * abs(yes - cursor) + ["enter"]
     for k in keys:
         press_key(pane, k)
         time.sleep(0.15)
@@ -968,9 +1225,9 @@ def step_prepare(p: dict) -> dict:
 
 def launch_line(kind: str, args: List[str]) -> str:
     argv = [ADAPTERS[kind].binary, *args]
-    # Codex's daemon runs commands outside the terminal. hc requires --no-daemon.
-    if kind == "codex" and "--no-daemon" not in argv:
-        argv.insert(1, "--no-daemon")
+    for flag in ADAPTERS[kind].launch_flags:
+        if flag not in argv:
+            argv.insert(1, flag)
     return shlex.join(argv)
 
 
@@ -983,11 +1240,70 @@ def agent_name_for(requested: Optional[str], source_name: Optional[str], kind: s
 
 
 def unique_terminal_name(name: str) -> str:
-    live = {t.get("name") for t in (hc_json("ls").get("terminals") or []) if t.get("name")}
+    # Names are unique on one machine. `hc ls` also lists other machines, and
+    # those terminals may use the same name.
+    live = {t.get("name") for t in (hc_json("ls").get("terminals") or [])
+            if t.get("name") and "/" not in (t.get("address") or "")}
     base, n = name, 2
     while name in live:
         name, n = f"{base}-{n}"[:32], n + 1
     return name
+
+
+def herdr_app(*args: str) -> Optional[dict]:
+    """One herdr-app command, or None when the app isn't there or doesn't answer."""
+    if not have("herdr-app"):
+        return None
+    try:
+        out = run(["herdr-app", *args], check=False).strip()
+    except HandoffError:
+        return None
+    if not out:
+        return None
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def show_in_app(addr: str, name: str, cwd: str) -> Optional[dict]:
+    """Give a core terminal a pane in the Herdr window. None when the app isn't
+    running: the terminal still exists, and `hc attach` reaches it."""
+    try:
+        return _show_in_app(addr, name, cwd)
+    except HandoffError:
+        return None
+
+
+def _show_in_app(addr: str, name: str, cwd: str) -> Optional[dict]:
+    listing = herdr_app("ls")
+    if not listing or "spaces" not in listing:
+        return None
+    cwd_real = os.path.realpath(cwd)
+    space = next((s for s in listing["spaces"]
+                  if not s.get("machine") and s.get("folder")
+                  and os.path.realpath(os.path.expanduser(s["folder"])) == cwd_real), None)
+    shell_tab = None
+    if space:
+        selected = herdr_app("do", "space.select", "--id", space["id"])
+        if not selected or selected.get("error"):
+            return None
+        space_id, space_name = space["id"], space.get("name") or name
+    else:
+        created = herdr_app("do", "space.new", "--name", name, "--folder", cwd,
+                            "--machine", "", "--focus", "true")
+        if not created or created.get("error") or "space" not in created:
+            return None
+        space_id, space_name, shell_tab = created["space"], name, created.get("tab")
+    kept = herdr_app("do", "terminal.keep", "--terminal", addr, "--place", "tab")
+    if not kept or kept.get("error") or not kept.get("tab"):
+        if shell_tab:
+            herdr_app("do", "space.close", "--id", space_id, "--confirmed", "true")
+        return None
+    if shell_tab:
+        herdr_app("do", "tab.close", "--id", shell_tab, "--confirmed", "true")
+    return {"space": space_name, "tab": kept["tab"]}
 
 
 def hc_attach(target: str, address: Optional[str], name: Optional[str]) -> str:
@@ -1028,6 +1344,14 @@ def step_start(p: dict) -> dict:
     addr = created["address"]
     try:
         wait_for_shell(addr, 20)
+        for step in p.get("prelude") or []:
+            hc_json("send", addr, step["cmd"])
+            wait_for_shell(addr, 90)
+            expect = step.get("expect")
+            screen = read_screen(addr)
+            if expect and not re.search(expect, screen):
+                tail = "\n".join(line for line in screen.splitlines() if line.strip())[-1200:]
+                raise HandoffError(f"setup on the target did not finish as expected; its last output:\n{tail}")
         hc_json("send", addr, launch_line(kind, list(p["args"])))
         # The shell is still in front for a moment after the command is sent.
         # Wait until the agent itself is in front, rather than treating that
@@ -1061,7 +1385,8 @@ def step_start(p: dict) -> dict:
         raise HandoffError(f"{kind} exited right after starting on the target; its last output:\n{tail}")
     if state == "blocked" and not waiting:
         waiting = ["unrecognized_prompt"]
-    return {"name": name, "pane_id": addr, "trust_prompt": trust, "waiting_for_user": waiting}
+    return {"name": name, "pane_id": addr, "trust_prompt": trust, "waiting_for_user": waiting,
+            "app": show_in_app(addr, name, p["cwd"])}
 
 
 def discard_terminal(addr: str) -> None:
@@ -1352,7 +1677,12 @@ def cmd_send(args) -> None:
     log(f"exiting {kind} in {pane}")
     exit_agent(pane, adapter)
     src_args = adapter.resume_args(handle["value"] if handle["kind"] == "id" else str(primary))
+    owned: Optional[Path] = None
     try:
+        captured, extras = adapter.capture(handle, src_cwd, primary, extras)
+        if captured != primary:
+            owned = captured.parent
+            primary = captured
         wip = make_wip(src_root)
         refspecs = [f"+HEAD:refs/handoff/{sid8}/head"]
         if wip:
@@ -1376,11 +1706,17 @@ def cmd_send(args) -> None:
         pairs += extra_pairs + [(str(HOME) + "/", probe["home"].rstrip("/") + "/")]
         sent = send_files(args.target, mapping, [(a, b) for a, b in pairs if a != b], adapter.verbatim)
         log(f"copied {len(sent)} session file(s)")
+        if owned:
+            shutil.rmtree(owned, ignore_errors=True)
+            owned = None
         name = agent_name_for(args.name, agent.get("name"), kind, src_root)
         started = remote(args.target, "start", {
             "kind": kind, "name": name, "cwd": dst_cwd, "trust": not args.no_trust,
+            "prelude": adapter.prelude(dst_handle, dst_cwd, mapping),
             "args": adapter.resume_args(dst_handle) + list(args.agent_args)})
     except Exception:
+        if owned:
+            shutil.rmtree(owned, ignore_errors=True)
         log(f"handoff failed; restarting {kind} in {pane}")
         try:
             remote(args.target, "cleanup-refs", {"repo": probe["repo"], "sid8": sid8})
@@ -1404,6 +1740,7 @@ def cmd_send(args) -> None:
         "target_agent": started["name"], "target_pane": started["pane_id"],
         "target_trust_prompt": started["trust_prompt"],
         "target_waiting_for_user": started["waiting_for_user"],
+        "target_app": started.get("app"),
         "source_changes_stashed": stashed, "source_pane_now_at_shell": pane,
         "attach": hc_attach(args.target, started["pane_id"], started.get("name")),
     }, indent=2))
