@@ -30,12 +30,6 @@ On each machine you hand sessions off from:
 npx skills add shanev/agent-handoff -g
 ```
 
-Hermes:
-
-```bash
-hermes skills install shanev/agent-handoff/skills/agent-handoff
-```
-
 ## Requirements
 
 On both machines: [hc](https://herdr.dev/core/) 0.1.13 or newer, with `hc server` running and the agent in an hc terminal; `python3` 3.9+, `git`, `ssh`, and `tar`; the agent's CLI on the interactive shell PATH and logged in; a clone of the repo with a git remote.

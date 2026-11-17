@@ -5,10 +5,6 @@ version: 0.6.2
 author: Shane Vitarana
 license: MIT
 platforms: [macos, linux]
-metadata:
-  hermes:
-    tags: [Coding-Agent, hc, Handoff, Claude, Codex, omp, pi, grok, OpenCode, SSH, Tailscale]
-    related_skills: [claude-code, codex]
 ---
 
 # Agent handoff
@@ -107,7 +103,7 @@ Checkouts are matched by any git remote (`git@github.com:o/r.git` and `https://g
 
 ## Limits
 
-- Supported agents: `claude`, `codex`, `omp`, `pi`, `grok`, `opencode`. Others (including `hermes`) fail with a clear error. Adding one means adding an adapter class to the script.
+- Supported agents: `claude`, `codex`, `omp`, `pi`, `grok`, `opencode`. Anything else fails with a clear error. Adding one means adding an adapter class to the script.
 - The repo must have at least one git remote, so it can be matched on the target.
 - The agent must be at rest (idle or done) before it quits. `--wait` and `--self` wait for that state; they do not answer approvals. `blocked` is not idle: the user still has to answer the screen.
 - hc does not record session ids. The script picks the newest transcript for the agent's folder written since the agent process started. If two agents of that kind share a folder it stops and asks for `--session`.
