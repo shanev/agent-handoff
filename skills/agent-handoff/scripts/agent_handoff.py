@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""agent-handoff: move a herdr-managed coding agent session to another machine.
+"""agent-handoff: move a coding-agent session to another machine.
 
-Runs on the machine that has the session. Everything that must happen on the
-target is done by piping this same file to `python3 -` over ssh, so the target
-needs only python3, git, herdr and the agent CLI (no install of this tool).
+The agent is running in an hc terminal (Herdr 2). This runs on the machine
+that has the session. Everything that must happen on the target is done by
+piping this same file to `python3 -` over ssh, so the target needs only
+python3, git, hc, and the agent CLI (no install of this tool).
 
 Stdlib only, Python 3.9+ (macOS ships 3.9).
 """
@@ -26,7 +27,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-VERSION = "0.4.7"
+VERSION = "0.6.0"
 RESULT_MARK = "AGENT_HANDOFF_RESULT:"
 HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "agent-handoff"
@@ -77,9 +78,99 @@ def git(repo: str, *args: str, index_file: Optional[str] = None, check: bool = T
     return run([*prefix, "git", "-C", repo, *args], check=check).strip()
 
 
-def herdr(*args: str) -> dict:
-    out = run(["herdr", *args]).strip()
-    return json.loads(out).get("result", {}) if out else {}  # send-text/send-keys print nothing
+def hc_json(*args: str) -> dict:
+    """One hc command. JSON is the default when stdout is a pipe; --json makes
+    `run` and `read` return JSON too (those two print text otherwise)."""
+    if args and "--json" not in args:
+        args = (args[0], "--json", *args[1:])
+    out = run(["hc", *args]).strip()
+    if not out:
+        return {}
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return {"text": out}
+    return data if isinstance(data, dict) else {"result": data}
+
+
+def hc_get(addr: str) -> dict:
+    return hc_json("get", addr)
+
+
+def hc_server_up() -> bool:
+    return ok(["hc", "ls", "--json"])
+
+
+def require_hc() -> None:
+    """hc must be installed and its server reachable."""
+    if not have("hc"):
+        raise HandoffError("missing on target: hc")
+    if not hc_server_up():
+        raise HandoffError("hc server not reachable on target (run `hc server start` there first)")
+
+
+# hc `ls` labels agents with these words. Shells and other programs are not agents.
+HC_KINDS = {"claude-code": "claude", "claude": "claude", "codex": "codex",
+            "omp": "omp", "pi": "pi", "grok": "grok"}
+SHELLS = {"sh", "bash", "zsh", "fish", "nu", "pwsh", "powershell", "cmd", "dash", "elvish"}
+
+
+def status_state(info: dict) -> Optional[str]:
+    status = info.get("status")
+    if isinstance(status, dict):
+        return status.get("state")
+    return status or None
+
+
+def status_app(info: dict) -> Optional[str]:
+    status = info.get("status")
+    return status.get("app") if isinstance(status, dict) else None
+
+
+def fg_argv0(info: dict) -> str:
+    fg = info.get("foreground") or {}
+    argv = fg.get("argv") or []
+    return os.path.basename(argv[0]) if argv else ""
+
+
+def app_is(info: dict, binary: str) -> bool:
+    app = status_app(info) or ""
+    return bool(binary) and (app == binary or HC_KINDS.get(app) == binary)
+
+
+def agent_in_foreground(info: dict, binary: str) -> bool:
+    if not binary:
+        return False
+    name = (info.get("foreground") or {}).get("name") or ""
+    base = fg_argv0(info)
+    return base == binary or name == binary or name.startswith(binary + "-") or name.startswith(binary + ".")
+
+
+def shell_back(info: dict, binary: str = "") -> bool:
+    """The terminal's program is a shell again (the agent has quit)."""
+    if info.get("state") == "finished":
+        return True
+    if binary and (agent_in_foreground(info, binary) or app_is(info, binary)):
+        return False
+    fg = info.get("foreground") or {}
+    if info.get("pid") and fg.get("pid") == info.get("pid"):
+        return True
+    name = fg.get("name") or ""
+    return fg_argv0(info) in SHELLS or name in SHELLS
+
+
+def kind_of_hc(row: dict) -> Optional[str]:
+    for label in (row.get("agent") or "", status_app(row) or "", fg_argv0(row)):
+        if label in HC_KINDS:
+            return HC_KINDS[label]
+        if label in ADAPTERS:
+            return label
+    return None
+
+
+def hc_version() -> str:
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", run(["hc", "--version"], check=False))
+    return ".".join(m.groups()) if m else "unknown"
 
 
 def log(msg: str) -> None:
@@ -91,7 +182,7 @@ CONFIG_VARS = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR", "GROK_H
 
 def adopt_login_path() -> None:
     """Non-interactive ssh gets a bare environment. Read the login shell's PATH
-    (so herdr, claude, codex, omp in /opt/homebrew/bin or ~/.local/bin resolve)
+    (so hc, claude, codex, omp in /opt/homebrew/bin or ~/.local/bin resolve)
     and the agents' config-dir variables. Uses `env` so it works in any shell;
     only the variables named here are kept."""
     global LOGIN_PATH
@@ -200,8 +291,8 @@ class Adapter:
     # First-run "do you trust this folder?" screen, and the option that says yes.
     trust_marker: Optional[str] = None
     trust_yes: Optional[str] = None
-    # Screens that are the user's call (never answered by this tool), e.g. codex
-    # asking to trust the hook `herdr integration install` just added.
+    # Screens that are the user's call (never answered by this tool), e.g. Codex
+    # asking to review hooks.
     user_screens: Dict[str, str] = {}
     # Files/dirs holding snapshots of the user's own files: copied without rewriting.
     verbatim: Tuple[str, ...] = ()
@@ -221,7 +312,7 @@ class Adapter:
         raise NotImplementedError
 
     def guess_handle(self, src_cwd: str, started_at: float) -> Optional[dict]:
-        """Find the session when herdr didn't record one. None if it can't."""
+        """Find the session from the transcript on disk. None if it can't."""
         return None
 
     def place(self, primary: Path, dst_cwd: str, dst_home: str, dst_root: str
@@ -242,7 +333,7 @@ class Claude(Adapter):
     kind = binary = "claude"
     config_var, default_root = "CLAUDE_CONFIG_DIR", ".claude"
     verbatim = ("file-history",)
-    # A machine where claude was never set up or isn't logged in. herdr reports
+    # A machine where claude was never set up or isn't logged in. hc reports
     # these as idle, so they must be recognised by their text.
     user_screens = {"first_run_setup": r"Let's get started|Choose the text style",
                     "login": r"Select login method|Not logged in"}
@@ -262,8 +353,7 @@ class Claude(Adapter):
                            f"{', '.join(str(r) for r in self.source_roots())}")
 
     def guess_handle(self, src_cwd, started_at):
-        # Without herdr's claude integration: the newest transcript for this cwd
-        # written since the agent started.
+        # The newest transcript for this cwd written since the agent started.
         for root in self.source_roots():
             f = newest_since((root / "projects" / claude_project_dir(src_cwd)).glob("*.jsonl"), started_at)
             if f:
@@ -307,9 +397,9 @@ class Codex(Adapter):
                            f"{', '.join(str(r) for r in self.source_roots())}")
 
     def guess_handle(self, src_cwd, started_at):
-        # herdr's codex integration doesn't report the thread id, and codex writes
-        # through a shared daemon, so match the newest rollout for this cwd that
-        # was written after the agent process started.
+        # hc doesn't record the thread id, and codex writes through a shared
+        # daemon, so match the newest rollout for this cwd written after the
+        # agent process started.
         best = None
         for root in self.source_roots():
             for f in (root / "sessions").glob("**/rollout-*.jsonl"):
@@ -343,7 +433,7 @@ class Omp(Adapter):
 
     def locate(self, handle, src_cwd):
         if handle["kind"] != "path":
-            raise HandoffError("herdr reported an omp session id, not a path; pass --session <path>")
+            raise HandoffError("omp sessions are files, not ids; pass --session <path>")
         primary = Path(handle["value"])
         if not primary.exists():
             raise HandoffError(f"omp session file {primary} does not exist")
@@ -454,27 +544,96 @@ def adapter_for(kind: str) -> Adapter:
     return ADAPTERS[kind]
 
 
-# ---------------------------------------------------------------- herdr helpers
+# ---------------------------------------------------------------- hc terminals
+
+
+def hc_agents() -> List[dict]:
+    """Live coding agents on this machine. `pane_id` is the terminal address (`t7`)."""
+    rows = []
+    for t in hc_json("ls").get("terminals") or []:
+        addr = t.get("address") or ""
+        if not addr or "/" in addr or t.get("state") not in (None, "live"):
+            continue  # another machine's terminals are not sessions on this host
+        kind = kind_of_hc(t)
+        if not kind:
+            continue
+        status = t.get("status")
+        if isinstance(status, dict):
+            status = status.get("state")
+        rows.append({"pane_id": addr, "agent": kind, "name": t.get("name"),
+                     "cwd": t.get("cwd"), "agent_status": status or "idle",
+                     "agent_session": None})
+    return rows
+
+
+def hydrate_hc(agent: dict) -> dict:
+    """`hc ls` reports the launch folder. The process's own folder (where the
+    session actually is) comes from `hc get`."""
+    info = hc_get(agent["pane_id"])
+    fg = info.get("foreground") or {}
+    if fg.get("cwd"):
+        agent["cwd"] = fg["cwd"]
+    state = status_state(info)
+    if state:
+        agent["agent_status"] = state
+    return agent
+
+
+def session_of(agent: dict) -> Optional[dict]:
+    if agent.get("agent_session"):
+        return agent["agent_session"]
+    if agent.get("agent") not in ADAPTERS:
+        return None
+    try:
+        proc, _, _ = foreground(agent["pane_id"], ADAPTERS[agent["agent"]].binary)
+    except HandoffError:
+        return None
+    if not proc or not proc.get("pid"):
+        return None
+    cwd = proc.get("cwd") or agent.get("cwd") or ""
+    return ADAPTERS[agent["agent"]].guess_handle(cwd, process_started_at(proc["pid"]))
 
 
 def find_agent(target: str) -> dict:
-    agents = herdr("agent", "list")["agents"]
+    agents = hc_agents()
     hits = [a for a in agents if target in (a.get("name"), a["pane_id"])]
     if not hits:
-        hits = [a for a in agents if (a.get("agent_session") or {}).get("value", "").startswith(target)]
+        for agent in agents:
+            sess = session_of(agent)
+            if sess and str(sess.get("value") or "").startswith(target):
+                agent["agent_session"] = sess
+                hits.append(agent)
+    if not hits and re.fullmatch(r"t[0-9a-z]+", target):
+        # `hc ls` labels some programs with a word we don't map. The address
+        # still resolves through the process `hc get` reports.
+        try:
+            info = hc_get(target)
+        except HandoffError:
+            info = {}
+        kind = kind_of_hc(info)
+        if kind and info.get("state") != "finished":
+            fg = info.get("foreground") or {}
+            hits = [{"pane_id": target, "agent": kind, "name": info.get("name"),
+                     "cwd": fg.get("cwd") or info.get("cwd"),
+                     "agent_status": status_state(info) or "idle",
+                     "agent_session": None}]
     if len(hits) != 1:
         names = ", ".join(f"{a.get('name') or a['pane_id']} ({a['agent']})" for a in agents)
-        raise HandoffError(f"'{target}' matches {len(hits)} agents; live agents: {names}")
-    return hits[0]
+        raise HandoffError(f"'{target}' matches {len(hits)} agents; live agents: {names or 'none'}")
+    return hydrate_hc(hits[0])
 
 
 def foreground(pane: str, binary: str = "") -> Tuple[Optional[dict], int, int]:
-    """The agent's own process in the pane's foreground group (not a child it
-    spawned, like caffeinate), plus the group id and shell pid."""
-    info = herdr("pane", "process-info", "--pane", pane)["process_info"]
-    procs = info.get("foreground_processes") or []
-    mine = [p for p in procs if binary and os.path.basename(p.get("argv0") or "") == binary]
-    return (mine[0] if mine else None), info["foreground_process_group_id"], info["shell_pid"]
+    """The agent's own process in the foreground (not a child it spawned, like
+    caffeinate), plus the foreground pid and the terminal's shell pid."""
+    info = hc_get(pane)
+    fg = info.get("foreground") or {}
+    argv = list(fg.get("argv") or [])
+    mine = None
+    if agent_in_foreground(info, binary):
+        mine = {"pid": fg.get("pid"), "cwd": fg.get("cwd"), "argv": argv,
+                "argv0": fg_argv0(info) or binary}
+    return mine, int(fg.get("pid") or 0), int(info.get("pid") or 0)
 
 
 def process_started_at(pid: int) -> float:
@@ -487,34 +646,45 @@ def process_started_at(pid: int) -> float:
     return time.time() - secs - int(days or 0) * 86400 - 5
 
 
-def wait_for_shell(pane: str, timeout: float) -> None:
+def wait_for_shell(pane: str, timeout: float, binary: str = "") -> None:
     end = time.time() + timeout
     while time.time() < end:
-        _, pgid, shell_pid = foreground(pane)
-        if pgid == shell_pid:
+        if shell_back(hc_get(pane), binary):
             return
         time.sleep(0.5)
-    raise HandoffError(f"pane {pane} did not return to its shell prompt within {timeout:.0f}s")
+    raise HandoffError(f"terminal {pane} did not return to its shell prompt within {timeout:.0f}s")
+
+
+def press_key(pane: str, key: str) -> None:
+    hc_json("keys", pane, key)
+
+
+def read_screen(pane: str) -> str:
+    return hc_json("read", "--lines", "0", pane).get("text") or ""
 
 
 def exit_agent(pane: str, adapter: Adapter) -> None:
-    herdr("pane", "send-text", pane, adapter.exit_text)
-    time.sleep(0.4)  # let slash-command autocomplete settle before Enter
-    herdr("pane", "send-keys", pane, "enter")
+    # `hc send` pastes the line and presses Enter. It refuses while the
+    # program is blocked, which is the ctrl+c path below.
     try:
-        wait_for_shell(pane, 20)
-        return
+        hc_json("send", pane, adapter.exit_text)
     except HandoffError:
         pass
+    else:
+        try:
+            wait_for_shell(pane, 20, adapter.binary)
+            return
+        except HandoffError:
+            pass
     # Not at a prompt that takes /exit (e.g. a first-run or login screen). TUIs
     # quit on a second ctrl+c within about a second, and a screen change can eat
     # one, so send quick pairs a few times.
     for _ in range(3):
-        herdr("pane", "send-keys", pane, "ctrl+c")
+        press_key(pane, "ctrl+c")
         time.sleep(0.3)
-        herdr("pane", "send-keys", pane, "ctrl+c")
+        press_key(pane, "ctrl+c")
         try:
-            wait_for_shell(pane, 1.5)
+            wait_for_shell(pane, 1.5, adapter.binary)
             return
         except HandoffError:
             continue
@@ -522,23 +692,26 @@ def exit_agent(pane: str, adapter: Adapter) -> None:
                        f"it may be showing a screen that needs the user")
 
 
-def start_agent(name: str, kind: str, pane: str, args: List[str]) -> dict:
-    last = None
-    for _ in range(10):  # a fresh pane's shell can take a moment to reach its prompt
-        try:
-            return herdr("agent", "start", name, "--kind", kind, "--pane", pane,
-                         "--timeout", "90000", "--", *args)
-        except HandoffError as e:
-            # The agent may be up but stopped at a first-run screen (herdr reports
-            # that as blocked and fails the start); that still counts as started.
-            occupant = next((a for a in herdr("agent", "list")["agents"] if a["pane_id"] == pane), None)
-            if occupant and occupant["agent"] == kind:
-                return {"agent": occupant}
-            last = e
-            if not re.search(r"agent_pane_busy|available|prompt", str(e)):
-                raise
-            time.sleep(1)
-    raise last  # type: ignore[misc]
+def wait_until_idle(pane: str, timeout: float, binary: str) -> None:
+    """Block until an hc agent is idle or done. `hc wait` also returns on
+    blocked, error and exit, so those are checked rather than treated as ready."""
+    deadline = time.time() + timeout
+    while True:
+        info = hc_get(pane)
+        state = status_state(info)
+        if state in ("idle", "done"):
+            return
+        if info.get("state") == "finished" or (state is None and not agent_in_foreground(info, binary)):
+            raise HandoffError(f"{binary} in {pane} exited while waiting; retry the handoff")
+        if time.time() >= deadline:
+            raise HandoffError(f"terminal {pane} stayed {state or 'busy'} for {timeout:.0f}s")
+        if state == "working":
+            remaining = max(1, int(deadline - time.time()))
+            result = hc_json("wait", pane, "--timeout", str(remaining))
+            if not result.get("ended") or result.get("reason") == "timeout":
+                raise HandoffError(f"terminal {pane} stayed working for {timeout:.0f}s")
+        else:
+            time.sleep(0.5)
 
 
 def answer_trust(pane: str, adapter: Adapter, accept: bool) -> str:
@@ -546,7 +719,7 @@ def answer_trust(pane: str, adapter: Adapter, accept: bool) -> str:
     if not adapter.trust_marker:
         return "none"
     for _ in range(8):
-        screen = run(["herdr", "pane", "read", pane, "--source", "visible", "--lines", "80"])
+        screen = read_screen(pane)
         if re.search(adapter.trust_marker, screen):
             break
         time.sleep(0.5)
@@ -556,26 +729,19 @@ def answer_trust(pane: str, adapter: Adapter, accept: bool) -> str:
         return "pending"
     lines = screen.splitlines()
     cursor = next((i for i, l in enumerate(lines) if re.match(r"\s*[❯›>]\s", l)), None)
-    yes = next((i for i, l in enumerate(lines) if re.search(adapter.trust_yes, l)), None)
+    yes = next((i for i, l in enumerate(lines) if re.search(adapter.trust_yes or "", l)), None)
     if cursor is None or yes is None:
         return "pending"
     keys = ["down" if yes > cursor else "up"] * abs(yes - cursor) + ["enter"]
     for k in keys:
-        herdr("pane", "send-keys", pane, k)
+        press_key(pane, k)
         time.sleep(0.15)
     for _ in range(10):
         time.sleep(0.5)
-        screen = run(["herdr", "pane", "read", pane, "--source", "visible", "--lines", "80"])
+        screen = read_screen(pane)
         if not re.search(adapter.trust_marker, screen):
             return "accepted"
     return "pending"
-
-
-def integration_state(kind: str) -> str:
-    for line in run(["herdr", "integration", "status"]).splitlines():
-        if line.startswith(f"{kind}:"):
-            return line.split(":", 1)[1].strip().split(" ")[0]
-    return "unknown"
 
 
 # ---------------------------------------------------------------- remote plumbing
@@ -730,34 +896,25 @@ def find_repo(remotes: List[str], branch: Optional[str], override: Optional[str]
 # ---------------------------------------------------------------- remote steps
 
 
-MIN_HERDR = (0, 8, 0)  # oldest version this has been tested with
+MIN_HC = (0, 1, 13)  # --no-parent and --outlive-parent
 
 
-def herdr_version() -> str:
-    m = re.search(r"(\d+)\.(\d+)\.(\d+)", run(["herdr", "--version"], check=False))
-    return ".".join(m.groups()) if m else "unknown"
-
-
-def check_herdr_version(where: str, version: str) -> None:
-    if version != "unknown" and tuple(int(x) for x in version.split(".")) < MIN_HERDR:
-        raise HandoffError(f"herdr {version} on {where} is older than "
-                           f"{'.'.join(map(str, MIN_HERDR))}; run `herdr update` there")
+def check_hc_version(where: str, version: str) -> None:
+    if version != "unknown" and tuple(int(x) for x in version.split(".")) < MIN_HC:
+        raise HandoffError(f"hc {version} on {where} is older than "
+                           f"{'.'.join(map(str, MIN_HC))}; run `hc update` there")
 
 
 def step_probe(p: dict) -> dict:
-    missing = [b for b in ("git", "herdr", p["binary"]) if not have(b)]
+    missing = [b for b in ("git", p["binary"]) if not have(b)]
     if missing:
         raise HandoffError(f"missing on target: {', '.join(missing)}")
-    try:
-        herdr("workspace", "list")
-    except HandoffError as e:
-        raise HandoffError(f"herdr server not reachable on target (start herdr there first): {e}")
+    require_hc()
     repo, others = find_repo(p["remotes"], p["branch"], p.get("dir"))
     return {"home": str(HOME), "repo": repo, "other_checkouts": others,
-            "integration": integration_state(p["kind"]),
             "config_root": str(ADAPTERS[p["kind"]].config_root(LOGIN_ENV)),
             "receive_pack": shutil.which("git-receive-pack", path=LOGIN_PATH),
-            "herdr_version": herdr_version()}
+            "hc_version": hc_version()}
 
 
 def step_prepare(p: dict) -> dict:
@@ -809,35 +966,118 @@ def step_prepare(p: dict) -> dict:
             "applied_changes": applied}
 
 
-def step_start(p: dict) -> dict:
-    kind, name = p["kind"], p["name"]
-    installed = False
-    if integration_state(kind) != "current":
-        run(["herdr", "integration", "install", kind])
-        installed = True
-    live = {a.get("name") for a in herdr("agent", "list")["agents"]}
+def launch_line(kind: str, args: List[str]) -> str:
+    argv = [ADAPTERS[kind].binary, *args]
+    # Codex's daemon runs commands outside the terminal. hc requires --no-daemon.
+    if kind == "codex" and "--no-daemon" not in argv:
+        argv.insert(1, "--no-daemon")
+    return shlex.join(argv)
+
+
+def agent_name_for(requested: Optional[str], source_name: Optional[str], kind: str, src_root: str) -> str:
+    name = requested or source_name or re.sub(
+        r"[^a-z0-9_-]", "-", f"{Path(src_root).name}-{kind}".lower()).strip("-")[:32]
+    if not name or not re.match(r"^[a-z]", name):
+        name = f"a{name}"[:32]
+    return name[:32]
+
+
+def unique_terminal_name(name: str) -> str:
+    live = {t.get("name") for t in (hc_json("ls").get("terminals") or []) if t.get("name")}
     base, n = name, 2
     while name in live:
         name, n = f"{base}-{n}"[:32], n + 1
-    args = ["workspace", "create", "--cwd", p["cwd"], "--label", p["label"]]
-    args.append("--focus" if p.get("focus") else "--no-focus")
-    ws = herdr(*args)
-    pane = ws["root_pane"]["pane_id"]
-    start_agent(name, kind, pane, p["args"])
+    return name
+
+
+def hc_attach(target: str, address: Optional[str], name: Optional[str]) -> str:
+    ident = name or address or ""
+    if target == LOCAL:
+        return f"hc attach {ident}".rstrip()
+    machine = None
+    try:
+        for row in hc_json("machine", "ls").get("machines") or []:
+            if row.get("target") == target or row.get("name") == target or row.get("host") == target.split("@")[-1]:
+                machine = row.get("name")
+                break
+    except HandoffError:
+        machine = None
+    if machine:
+        return f"hc attach {machine}/{ident}".rstrip("/")
+    return f"ssh -t {target} hc attach {ident}".rstrip()
+
+
+def schedule_rm(addr: str) -> None:
+    """Remove a terminal after this process exits and it has finished."""
+    if not addr:
+        return
+    subprocess.Popen(
+        ["/bin/sh", "-c",
+         "i=0; while [ \"$i\" -lt 10 ]; do hc rm " + shlex.quote(addr)
+         + " >/dev/null 2>&1 && exit 0; i=$((i+1)); sleep 1; done"],
+        start_new_session=True, stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+
+
+def step_start(p: dict) -> dict:
+    """Open a shell terminal and start the agent in it, so quitting the agent
+    later leaves the shell."""
+    kind, name = p["kind"], unique_terminal_name(p["name"])
+    created = hc_json("run", "--bg", "--name", name, "--cwd", p["cwd"],
+                      "--no-parent", "--outlive-parent", "--keep")
+    addr = created["address"]
+    try:
+        wait_for_shell(addr, 20)
+        hc_json("send", addr, launch_line(kind, list(p["args"])))
+        # The shell is still in front for a moment after the command is sent.
+        # Wait until the agent itself is in front, rather than treating that
+        # gap as the agent having already exited.
+        binary = ADAPTERS[kind].binary
+        deadline = time.time() + 25
+        info = hc_get(addr)
+        while time.time() < deadline and not (
+                agent_in_foreground(info, binary) or app_is(info, binary)):
+            if info.get("state") == "finished":
+                break
+            time.sleep(0.4)
+            info = hc_get(addr)
+        if not agent_in_foreground(info, binary) and not app_is(info, binary):
+            screen = read_screen(addr)
+            tail = "\n".join(line for line in screen.splitlines() if line.strip())[-1200:]
+            raise HandoffError(f"{kind} exited right after starting on the target; its last output:\n{tail}")
+    except HandoffError:
+        discard_terminal(addr)
+        raise
     adapter = ADAPTERS[kind]
-    trust = answer_trust(pane, adapter, p.get("trust", True))
+    trust = answer_trust(addr, adapter, p.get("trust", True))
     time.sleep(1)
-    screen = run(["herdr", "pane", "read", pane, "--source", "visible", "--lines", "80"])
+    screen = read_screen(addr)
     waiting = [k for k, rx in adapter.user_screens.items() if re.search(rx, screen)]
-    status = next((a["agent_status"] for a in herdr("agent", "list")["agents"] if a["pane_id"] == pane), None)
-    if status is None:  # it started, then exited (bad flag, auth, daemon error, ...)
-        tail = "\n".join(l for l in screen.splitlines() if l.strip())[-1200:]
+    info = hc_get(addr)
+    state = status_state(info)
+    if info.get("state") == "finished" or (
+            not agent_in_foreground(info, adapter.binary) and state not in ("idle", "working", "done", "blocked", "error")):
+        tail = "\n".join(line for line in screen.splitlines() if line.strip())[-1200:]
         raise HandoffError(f"{kind} exited right after starting on the target; its last output:\n{tail}")
-    if status == "blocked" and not waiting:
-        waiting = ["unrecognized_prompt"]  # e.g. a screen whose wording changed in a new agent version
-    return {"name": name, "pane_id": pane, "workspace_id": ws["workspace"]["workspace_id"],
-            "installed_integration": installed, "trust_prompt": trust,
-            "waiting_for_user": waiting}
+    if state == "blocked" and not waiting:
+        waiting = ["unrecognized_prompt"]
+    return {"name": name, "pane_id": addr, "trust_prompt": trust, "waiting_for_user": waiting}
+
+
+def discard_terminal(addr: str) -> None:
+    try:
+        hc_json("kill", addr)
+    except HandoffError:
+        pass
+    try:
+        hc_json("rm", addr)
+    except HandoffError:
+        pass
+
+
+def restart_in_terminal(pane: str, kind: str, args: List[str]) -> None:
+    wait_for_shell(pane, 15, ADAPTERS[kind].binary)
+    hc_json("send", pane, launch_line(kind, args))
 
 
 def step_cleanup_refs(p: dict) -> dict:
@@ -948,14 +1188,15 @@ def ssh_git_url(target: str, path: str) -> str:
 
 
 def cmd_list(_args) -> None:
+    me = os.environ.get("HC_TERMINAL_ID")
     rows = []
-    for a in herdr("agent", "list")["agents"]:
+    for a in hc_agents():
         sess = a.get("agent_session") or {}
         rows.append({"target": a.get("name") or a["pane_id"], "kind": a["agent"],
                      "status": a["agent_status"], "cwd": a["cwd"],
                      "session": sess.get("value"),
                      "supported": a["agent"] in ADAPTERS,
-                     "this_pane": a["pane_id"] == os.environ.get("HERDR_PANE_ID")})
+                     "this_pane": a["pane_id"] == me})
     print(json.dumps(rows, indent=2))
 
 
@@ -970,46 +1211,47 @@ def run_from(host: str, argv: List[str]) -> None:
     sys.exit(rc)
 
 
+def defer_payload(args, agent: dict, proc: Optional[dict], handle: dict,
+                  target_repo: str, src_root: str, stage: Path) -> dict:
+    script = stage / "agent_handoff.py"
+    shutil.copyfile(__file__, script)
+    local_worktree = args.target == LOCAL and os.path.realpath(target_repo) == os.path.realpath(src_root)
+    return dict(vars(args), agent=agent["pane_id"], session=handle["value"],
+                dir=None if local_worktree else target_repo,
+                new_worktree=args.new_worktree or local_worktree,
+                wait=True, self_handoff=False, dry_run=False, deferred_helper=True,
+                expected_kind=agent["agent"], expected_pid=(proc or {}).get("pid"),
+                expected_session=agent.get("agent_session"))
+
+
 def defer_send(args, agent: dict, proc: Optional[dict], src_cwd: str,
                handle: dict, target_repo: str, src_root: str) -> dict:
-    """Run a stable copy in its own terminal, outside the source agent's process tree."""
+    """A terminal with no parent, so it keeps running after the source agent quits."""
     stage = Path(tempfile.mkdtemp(prefix="agent-handoff-"))
-    workspace = None
     try:
-        script = stage / "agent_handoff.py"
-        shutil.copyfile(__file__, script)
-        local_worktree = args.target == LOCAL and os.path.realpath(target_repo) == os.path.realpath(src_root)
-        deferred = dict(vars(args), agent=agent["pane_id"], session=handle["value"],
-                        dir=None if local_worktree else target_repo,
-                        new_worktree=args.new_worktree or local_worktree,
-                        wait=True, self_handoff=False, dry_run=False,
-                        expected_kind=agent["agent"], expected_pid=(proc or {}).get("pid"),
-                        expected_session=agent.get("agent_session"))
-        create = ["workspace", "create", "--cwd", src_cwd,
-                  "--label", "agent-handoff helper", "--no-focus"]
-        for key in CONFIG_VARS:
-            value = os.environ.get(key) or LOGIN_ENV.get(key)
-            if value:
-                create += ["--env", f"{key}={value}"]
-        workspace = herdr(*create)
-        pane = workspace["root_pane"]["pane_id"]
-        deferred["helper_workspace"] = workspace["workspace"]["workspace_id"]
+        deferred = defer_payload(args, agent, proc, handle, target_repo, src_root, stage)
+        name = unique_terminal_name("handoff-helper")
         payload = stage / "send.json"
+        script = stage / "agent_handoff.py"
+        # Written before the terminal starts: the helper reads it as soon as it runs.
         payload.write_text(json.dumps(deferred))
         command = shlex.join([sys.executable, str(script), "--deferred", str(payload)])
-        wait_for_shell(pane, 20)
-        herdr("pane", "run", pane, command)
+        # Stay at a shell when the move fails, so the error is still on screen.
+        wrapper = command + " || exec \"${SHELL:-/bin/sh}\""
+        argv = ["/bin/sh", "-c", wrapper]
+        exports = [f"{key}={os.environ.get(key) or LOGIN_ENV.get(key)}"
+                   for key in CONFIG_VARS if os.environ.get(key) or LOGIN_ENV.get(key)]
+        if exports:
+            argv = ["env", *exports, *argv]
+        created = hc_json("run", "--bg", "--name", name, "--cwd", src_cwd,
+                          "--no-parent", "--outlive-parent", "--no-notify", "--", *argv)
+        addr = created["address"]
     except Exception:
-        if workspace:
-            try:
-                herdr("workspace", "close", workspace["workspace"]["workspace_id"])
-            except HandoffError as e:
-                log(f"could not close helper workspace: {e}")
-        shutil.rmtree(stage)
+        shutil.rmtree(stage, ignore_errors=True)
         raise
-    return {"ok": True, "deferred": True, "pane": pane,
-            "workspace": deferred["helper_workspace"], "target": args.target,
-            "attach": None if args.target == LOCAL else f"herdr --remote {args.target}"}
+    intended = agent_name_for(args.name, agent.get("name"), agent["agent"], src_root)
+    return {"ok": True, "deferred": True, "pane": addr, "target": args.target,
+            "attach": hc_attach(args.target, None, intended)}
 
 
 def run_deferred(payload: Path) -> None:
@@ -1019,27 +1261,24 @@ def run_deferred(payload: Path) -> None:
     finally:
         # The shell keeps the error output even after this temporary copy is removed.
         shutil.rmtree(payload.parent)
-    try:
-        herdr("workspace", "close", args.helper_workspace)
-    except HandoffError as e:
-        log(f"handoff succeeded, but could not close helper workspace: {e}")
+    # This process is the helper terminal, so its own id is the one to remove.
+    schedule_rm(os.environ.get("HC_TERMINAL_ID") or "")
 
 
 def cmd_send(args) -> None:
     agent = find_agent(args.agent)
     pane, kind = agent["pane_id"], agent["agent"]
-    this_pane = pane == os.environ.get("HERDR_PANE_ID")
+    this_pane = pane == os.environ.get("HC_TERMINAL_ID")
     if this_pane and not args.self_handoff and not args.dry_run:
         raise HandoffError("refusing to hand off the agent running this command; "
                            "pass --self to move it after this turn ends")
-    deferred = hasattr(args, "helper_workspace")
+    deferred = bool(getattr(args, "deferred_helper", False))
     if not args.self_handoff and not args.dry_run and (deferred or agent["agent_status"] in ("working", "blocked")):
         if not args.wait:
             raise HandoffError(f"{kind} in {pane} is {agent['agent_status']}; let it finish "
                                f"(or rerun with --wait)")
         log(f"waiting up to {args.wait_timeout}s for {pane} to go idle")
-        herdr("agent", "wait", pane, "--until", "idle", "--until", "done",
-              "--timeout", str(args.wait_timeout * 1000))
+        wait_until_idle(pane, args.wait_timeout, ADAPTERS[kind].binary if kind in ADAPTERS else kind)
         agent = find_agent(pane)
         if agent["agent"] != kind:
             raise HandoffError(f"the agent in {pane} changed while waiting; retry the handoff")
@@ -1056,17 +1295,16 @@ def cmd_send(args) -> None:
         raise HandoffError(f"the agent in {pane} changed while waiting; retry the handoff")
     src_cwd = (proc or {}).get("cwd") or agent["cwd"]
     if not handle and proc:
-        same_dir = [a for a in herdr("agent", "list")["agents"]
-                    if a["agent"] == kind and a["cwd"] == agent["cwd"]]
+        # `hc ls` reports the launch folder; the session follows the live one.
+        peers = [hydrate_hc(dict(a)) for a in hc_agents()]
+        same_dir = [a for a in peers if a["agent"] == kind and a["cwd"] == src_cwd]
         if len(same_dir) > 1:
-            raise HandoffError(f"{len(same_dir)} {kind} agents share {agent['cwd']} and herdr has no "
+            raise HandoffError(f"{len(same_dir)} {kind} agents share {agent['cwd']} and hc has no "
                                f"session id for {pane}; pass --session <id-or-path>")
         handle = adapter.guess_handle(src_cwd, process_started_at(proc["pid"]))
     if not handle:
-        state = integration_state(kind)
-        hint = (f"run `herdr integration install {kind}` and restart the agent"
-                if state != "current" else "pass --session <id-or-path>")
-        raise HandoffError(f"herdr doesn't know {kind}'s session id in {pane}; {hint}")
+        raise HandoffError(f"couldn't find {kind}'s transcript for {pane} "
+                           f"(hc doesn't record session ids); pass --session <id-or-path>")
 
     src_root = git(src_cwd, "rev-parse", "--show-toplevel")
     rel = os.path.relpath(os.path.realpath(src_cwd), os.path.realpath(src_root))
@@ -1097,13 +1335,13 @@ def cmd_send(args) -> None:
             new_branch = True  # same repo: its branch is checked out here, so use handoff/<id>
     probe = remote(args.target, "probe", {"remotes": remotes, "branch": branch,
                                           "dir": target_dir, "binary": adapter.binary, "kind": kind})
-    check_herdr_version("this machine", herdr_version())
-    check_herdr_version(where, probe["herdr_version"])
+    check_hc_version("this machine", hc_version())
+    check_hc_version(where, probe.get("hc_version", "unknown"))
     plan = {"agent": agent.get("name") or pane, "kind": kind, "session": handle["value"],
-            "transcript": str(primary), "source_repo": src_root, "branch": branch or "(detached)",
-            "dirty": is_dirty(src_root), "target": args.target, "target_repo": probe["repo"],
-            "other_target_checkouts": probe["other_checkouts"],
-            "target_integration": probe["integration"], "source_argv": (proc or {}).get("argv")}
+            "transcript": str(primary), "source_repo": src_root,
+            "branch": branch or "(detached)", "dirty": is_dirty(src_root), "target": args.target,
+            "target_repo": probe["repo"], "other_target_checkouts": probe["other_checkouts"],
+            "source_argv": (proc or {}).get("argv")}
     if args.dry_run:
         print(json.dumps({"dry_run": True, **plan}, indent=2))
         return
@@ -1128,7 +1366,7 @@ def cmd_send(args) -> None:
         dst_cwd = os.path.normpath(os.path.join(prep["worktree"], rel))
         mapping, extra_pairs, dst_handle = adapter.place(primary, dst_cwd, probe["home"],
                                                          probe["config_root"])
-        # The repo root as git, the agent and herdr spell it (they differ across
+        # The repo root as git and the agent spell it (they differ across
         # symlinks, e.g. macOS /tmp -> /private/tmp); rewrite every spelling.
         roots = {os.path.realpath(src_root), src_root}
         for cwd in (src_cwd, agent["cwd"]):
@@ -1138,13 +1376,9 @@ def cmd_send(args) -> None:
         pairs += extra_pairs + [(str(HOME) + "/", probe["home"].rstrip("/") + "/")]
         sent = send_files(args.target, mapping, [(a, b) for a, b in pairs if a != b], adapter.verbatim)
         log(f"copied {len(sent)} session file(s)")
-        name = args.name or agent.get("name") or re.sub(
-            r"[^a-z0-9_-]", "-", f"{Path(src_root).name}-{kind}".lower()).strip("-")[:32]
-        if not re.match(r"^[a-z]", name):
-            name = f"a{name}"[:32]
+        name = agent_name_for(args.name, agent.get("name"), kind, src_root)
         started = remote(args.target, "start", {
-            "kind": kind, "name": name, "cwd": dst_cwd, "focus": not args.no_focus,
-            "label": f"{Path(prep['worktree']).name} ({kind})", "trust": not args.no_trust,
+            "kind": kind, "name": name, "cwd": dst_cwd, "trust": not args.no_trust,
             "args": adapter.resume_args(dst_handle) + list(args.agent_args)})
     except Exception:
         log(f"handoff failed; restarting {kind} in {pane}")
@@ -1153,7 +1387,7 @@ def cmd_send(args) -> None:
         except HandoffError as e:
             log(f"could not clean up refs on target: {e}")
         try:
-            start_agent(agent.get("name") or f"{kind}-{sid8}".lower(), kind, pane, src_args)
+            restart_in_terminal(pane, kind, src_args)
         except HandoffError as e:
             log(f"could not restart it; run `{adapter.binary} {shlex.join(src_args)}` in {pane}: {e}")
         raise
@@ -1168,20 +1402,20 @@ def cmd_send(args) -> None:
         "target_cwd": dst_cwd, "created_worktree": prep["created_worktree"],
         "applied_uncommitted_changes": prep["applied_changes"],
         "target_agent": started["name"], "target_pane": started["pane_id"],
-        "installed_target_integration": started["installed_integration"],
         "target_trust_prompt": started["trust_prompt"],
         "target_waiting_for_user": started["waiting_for_user"],
         "source_changes_stashed": stashed, "source_pane_now_at_shell": pane,
-        "attach": None if args.target == LOCAL else f"herdr --remote {args.target}",
+        "attach": hc_attach(args.target, started["pane_id"], started.get("name")),
     }, indent=2))
 
 
 def cmd_doctor(args) -> None:
-    report = {"version": VERSION, "herdr_env": os.environ.get("HERDR_ENV") == "1",
-              "herdr_version": herdr_version() if have("herdr") else None,
+    report = {"version": VERSION,
+              "hc_env": bool(os.environ.get("HC_TERMINAL_ID")),
+              "hc_version": hc_version() if have("hc") else None,
+              "hc_server": hc_server_up() if have("hc") else False,
               "config_roots": {k: [str(r) for r in a.source_roots()] for k, a in ADAPTERS.items()},
-              "tools": {b: have(b) for b in ("git", "herdr", "ssh", *ADAPTERS)},
-              "integrations": {k: integration_state(k) for k in ADAPTERS}}
+              "tools": {b: have(b) for b in ("git", "hc", "ssh", *ADAPTERS)}}
     if args.target:
         try:
             report["target"] = remote(args.target, "doctor", {})
@@ -1192,13 +1426,11 @@ def cmd_doctor(args) -> None:
 
 def step_doctor(_p: dict) -> dict:
     return {"home": str(HOME), "python": sys.version.split()[0],
-            "herdr_version": herdr_version() if have("herdr") else None,
+            "hc_version": hc_version() if have("hc") else None,
+            "hc_server": hc_server_up() if have("hc") else False,
             "git_receive_pack": shutil.which("git-receive-pack", path=LOGIN_PATH),
             "config_roots": {k: str(a.config_root(LOGIN_ENV)) for k, a in ADAPTERS.items()},
-            "tools": {b: have(b) for b in ("git", "herdr", *ADAPTERS)},
-            "herdr_server": ok(["herdr", "workspace", "list"]),
-            "integrations": {k: integration_state(k) for k in ADAPTERS}
-            if have("herdr") else {}}
+            "tools": {b: have(b) for b in ("git", "hc", *ADAPTERS)}}
 
 
 REMOTE_STEPS["doctor"] = step_doctor
@@ -1216,14 +1448,14 @@ def main() -> None:
         remote_main(sys.argv[2], json.loads(sys.argv[3]))
         return
     ap = argparse.ArgumentParser(prog="agent_handoff.py",
-                                 description="Move a herdr-managed agent session to another machine.")
+                                 description="Move an hc agent session to another machine.")
     ap.add_argument("--version", action="version", version=VERSION)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("list", help="list herdr agents and whether they can be handed off")
+    sub.add_parser("list", help="list hc agents and whether they can be handed off")
     d = sub.add_parser("doctor", help="check prerequisites here and (optionally) on a target")
     d.add_argument("target", nargs="?")
     s = sub.add_parser("send", help="hand an agent off to a target machine")
-    s.add_argument("agent", help="herdr agent name, pane id, or session id prefix")
+    s.add_argument("agent", help="terminal name, address (t7), or session id prefix")
     s.add_argument("target", nargs="?",
                    help="ssh target, e.g. vega@vega (with --from, defaults to this machine)")
     s.add_argument("--here", action="store_true",
@@ -1233,17 +1465,16 @@ def main() -> None:
                    help="with --here: move the session into a new worktree of the same repo")
     s.add_argument("--dir", help="checkout to use on the target (skips discovery)")
     s.add_argument("--name", help="agent name on the target")
-    s.add_argument("--session", help="session id or path, if herdr doesn't report one")
+    s.add_argument("--session", help="session id or path, when the transcript guess is ambiguous")
     s.add_argument("--new-branch", action="store_true",
                    help="use a fresh handoff/<id> branch on the target instead of the source branch")
     s.add_argument("--keep-source-changes", action="store_true",
                    help="don't stash the source checkout's uncommitted changes after handoff")
     s.add_argument("--wait", action="store_true", help="wait for a working agent to go idle first")
     s.add_argument("--self", dest="self_handoff", action="store_true",
-                   help="move the agent running this command via a helper pane after its turn ends")
+                   help="move the agent running this command via a helper terminal after its turn ends")
     s.add_argument("--wait-timeout", type=int, default=1800, metavar="SECONDS",
                    help="maximum time to wait for idle with --wait or --self (default: 1800 seconds)")
-    s.add_argument("--no-focus", action="store_true", help="don't focus the new workspace on the target")
     s.add_argument("--no-trust", action="store_true",
                    help="leave the agent's 'trust this folder?' prompt on the target for the user")
     s.add_argument("--dry-run", action="store_true", help="show the plan without changing anything")
