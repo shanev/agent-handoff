@@ -13,8 +13,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        python: ["3.9", "3.13"]  # 3.9 is what stock macOS ships
+        include:
+          # ubuntu-latest is 26.04, which has no Python 3.9 build.
+          # 3.9 is what stock macOS ships, so that check stays on macOS.
+          - os: ubuntu-latest
+            python: "3.13"
+          - os: macos-latest
+            python: "3.9"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
