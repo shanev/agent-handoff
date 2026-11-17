@@ -4,9 +4,7 @@
 
 Move a running coding-agent session to another machine and keep going there.
 
-![The Herdr app on m3max after a handoff, with the session in the readme-demo space recalling its passphrase](docs/agent-handoff-demo.gif)
-
-<sub>The Herdr window on m3max after a real handoff. [MP4](docs/agent-handoff-demo.mp4)</sub>
+![](docs/agent-handoff-move.png)
 
 It moves Claude Code, Codex, omp (oh-my-pi), pi, grok, and OpenCode. Any agent that supports [skills](https://skills.sh) can do the moving, including moving its own session after the current turn ends.
 
@@ -48,26 +46,13 @@ The procedure, the prompts, and the limits are in [`skills/agent-handoff/SKILL.m
 
 ## Herdr
 
-`herdr/handoff/` is a mod: a Hand off button for the agent you're looking at. Pick a machine, then confirm. It quits that agent and resumes the same session there.
+Right-click an agent and pick a space on another machine. The agent quits and resumes in that space's folder.
 
 ```sh
-cp -r herdr/handoff ~/.config/herdr-app/mods/
-herdr-app check ~/.config/herdr-app/mods/handoff
+python3 herdr/handoff/wire.py
 ```
 
-Herdr's own layouts are read-only. Clone one and add the button to the status row:
-
-```sh
-herdr-app do layout.clone '{"name":"main","as":"main-handoff"}'
-```
-
-In `~/.config/herdr-app/layouts/main-handoff.json`:
-
-```json
-{ "type": "block", "id": "handoff", "size": { "px": 28 }, "content": { "mod": "handoff" } }
-```
-
-The script has to be installed on the machine where Herdr is running. Set `AGENT_HANDOFF` to the script path if it lives somewhere else.
+That installs `herdr/handoff/` and adds the right-click to a copy of Herdr's agent list. The script has to be installed on the machine where Herdr is running. Set `AGENT_HANDOFF` to its path if it lives somewhere else.
 
 ## Tests
 

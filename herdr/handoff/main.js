@@ -1,8 +1,9 @@
-// handoff: move the focused agent to another machine.
-// Click the button, pick a machine, then confirm. https://github.com/shanev/agent-handoff
+// Move the agent you right-clicked into a space on another machine.
+// The agents list opens this popup; herdr/handoff/wire.py adds that right-click.
+// https://github.com/shanev/agent-handoff
 import { View, div } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
-import { agents, checking, closeOverlay, exec, focused, hc, openOverlay, props, theme } from "herdr";
+import { agents, checking, closeOverlay, exec, focused, hc, machines, openOverlay, props, spaces, theme } from "herdr";
 
 // Finds the skill's script on the machine where Herdr is running. AGENT_HANDOFF overrides it.
 const FIND = `
@@ -38,15 +39,53 @@ function labelOf(a) {
   return a.program?.name || a.app || "agent";
 }
 
+// Spaces the agent can move to: other machines, or this computer when it is already remote.
+function destinations(address, currentSpace) {
+  const source = address.includes("/") ? address.split("/")[0] : null;
+  const groups = [];
+  const add = (key, title, space) => {
+    let g = groups.find((x) => x.key === key);
+    if (!g) groups.push(g = { key, title, spaces: [] });
+    g.spaces.push(space);
+  };
+  for (const s of spaces()) {
+    if (!s.folder || s.id === currentSpace) continue;
+    if (source == null) {
+      if (s.machine) add(s.machine, s.machine, s);
+    } else if (s.machine == null) {
+      add("", "This computer", s);
+    } else if (s.machine !== source) {
+      add(s.machine, s.machine, s);
+    }
+  }
+  return groups;
+}
+
+function sendArgs(address, space, rows) {
+  const dir = space.folder;
+  const slash = address.indexOf("/");
+  if (slash === -1) {
+    const dest = rows.find((m) => m.name === space.machine);
+    if (!dest?.target) throw new Error(`No SSH target for ${space.machine}. Add it with hc machine add.`);
+    return ["send", address, dest.target, "--dir", dir];
+  }
+  const source = rows.find((m) => m.name === address.slice(0, slash));
+  if (!source?.target) throw new Error(`No SSH target for ${address.slice(0, slash)}.`);
+  const id = address.slice(slash + 1);
+  if (!space.machine) return ["send", id, "--from", source.target, "--dir", dir];
+  const dest = rows.find((m) => m.name === space.machine);
+  if (!dest?.target) throw new Error(`No SSH target for ${space.machine}.`);
+  return ["send", id, dest.target, "--from", source.target, "--dir", dir];
+}
+
 export default class Handoff extends View {
   init(_props, cx) {
     this.detail = Boolean(props()?.detail);
-    this.machines = null;
+    this.rows = null;
     this.picked = null;
     this.busy = false;
     this.error = null;
-    this.output = "";
-    this.fromSsh = null;
+    this.done = false;
     if (checking() || !this.detail) return;
     this.load(cx);
   }
@@ -56,22 +95,9 @@ export default class Handoff extends View {
       try {
         const r = await hc(["machine", "ls"]);
         if (r.code !== 0) throw new Error((r.stderr || r.stdout || `exit ${r.code}`).trim());
-        const rows = JSON.parse(r.stdout).machines || [];
-        const address = props().address || "";
-        const slash = address.indexOf("/");
-        const source = slash === -1 ? null : address.slice(0, slash);
-        const known = rows.filter((m) => m && m.target);
-        this.fromSsh = source ? (known.find((m) => m.name === source)?.target || null) : null;
-        const dests = [];
-        if (source) dests.push({ name: "This computer", here: true, ssh: null });
-        for (const m of known) {
-          if (m.name === source) continue;
-          dests.push({ name: m.name, here: false, ssh: m.target });
-        }
-        this.machines = dests;
-        this.error = source && !this.fromSsh ? `No SSH target for ${source}. Add it with hc machine add.` : null;
+        this.rows = JSON.parse(r.stdout).machines || [];
       } catch (e) {
-        this.machines = [];
+        this.rows = [];
         this.error = String(e?.message ?? e);
       }
       cx.notify();
@@ -79,31 +105,24 @@ export default class Handoff extends View {
   }
 
   move(cx) {
-    if (this.busy || !this.picked) return;
-    const p = props();
-    const dest = this.picked;
-    const slash = (p.address || "").indexOf("/");
+    if (this.busy || !this.picked || this.done) return;
     let args;
-    if (slash === -1) {
-      if (!dest.ssh) return;
-      args = ["send", p.address, dest.ssh];
-    } else if (!this.fromSsh) {
+    try {
+      args = sendArgs(props().address, this.picked, this.rows || []);
+    } catch (e) {
+      this.error = String(e?.message ?? e);
+      cx.notify();
       return;
-    } else if (dest.here) {
-      args = ["send", p.address.slice(slash + 1), "--from", this.fromSsh];
-    } else {
-      args = ["send", p.address.slice(slash + 1), dest.ssh, "--from", this.fromSsh];
     }
     this.busy = true;
     this.error = null;
-    this.output = "";
     cx.notify();
     cx.spawn(async (cx) => {
       try {
         const r = await exec("/bin/sh", ["-c", FIND, "agent-handoff", ...args], { timeout: 600000 });
         const text = `${r.stdout || ""}${r.stderr || ""}`.trim();
-        this.output = text;
         if (r.code !== 0) this.error = text.split("\n").filter(Boolean).pop() || `exit ${r.code}`;
+        else this.done = true;
       } catch (e) {
         this.error = String(e?.message ?? e);
       }
@@ -120,19 +139,19 @@ export default class Handoff extends View {
     const t = theme();
     const a = subject();
     const row = h_flex().id("handoff").size_full().px(12).gap(8).items_center().justify_end()
-      .bg(t.chrome).border_t(1).border_color(t.border).text_size(12).text_color(t.muted);
+      .bg(t.chrome).text_size(12).text_color(t.muted);
     if (!a) return row.child(div().child("Hand off"));
     const label = labelOf(a);
-    const where = a.space_name || a.tab_name || a.address;
+    const where = a.space_name || a.title || a.address;
     return row.child(
       div().id("handoff-open").px(8).py(3).rounded(6).text_color(t.foreground)
         .hover((s) => s.bg(t.hover))
         .on_click(() => openOverlay({
           mod: "handoff",
-          props: { detail: true, address: a.address, label, where },
+          props: { detail: true, address: a.address, label, where, space: a.space },
           kind: "popup",
-          width: 380,
-          height: 320,
+          width: 420,
+          height: 380,
           at: "pointer",
         }))
         .child(`Hand off ${label} · ${where}`));
@@ -141,38 +160,43 @@ export default class Handoff extends View {
   renderDetail(cx) {
     const t = theme();
     const p = props();
-    const box = v_flex().id("handoff-detail").size_full().p(14).gap(10).bg(t.popover)
+    const groups = this.rows == null ? [] : destinations(p.address || "", p.space);
+    const waiting = machines().filter((m) => m.name && m.layout === "loading");
+    const box = v_flex().id("handoff-detail").size_full().p(12).gap(8).bg(t.popover)
       .text_size(12.5).text_color(t.foreground).overflow_y_scrollbar();
-    box.child(div().font_semibold().child(`Hand off ${p.label || "agent"}`));
+    box.child(div().font_semibold().child(`Move ${p.label || "agent"}`));
     box.child(div().text_size(11.5).text_color(t.muted)
-      .child(`${p.where || p.address}. This quits it and resumes the same session on the machine you pick.`));
-    if (this.machines == null) {
-      box.child(div().text_color(t.muted).child("Looking up machines…"));
-    } else if (!this.machines.length) {
-      box.child(div().text_color(t.muted).child("No other machines. Add one with hc machine add."));
-    } else {
-      for (const m of this.machines) {
-        const on = this.picked && this.picked.name === m.name;
+      .child("Pick a space on another machine. This quits the agent and resumes it in that folder."));
+    if (this.rows == null) box.child(div().text_color(t.muted).child("Looking up machines…"));
+    else if (!groups.length) box.child(div().text_color(t.muted).child(
+      waiting.length ? "Waiting for the other machine…" : "No spaces on another machine yet."));
+    let n = 0;
+    for (const g of groups) {
+      box.child(div().pt(4).text_size(11).font_medium().text_color(t.dim).child(g.title));
+      for (const s of g.spaces) {
+        const on = this.picked && this.picked.id === s.id;
+        const i = n++;
         box.child(
-          h_flex().id(`dest-${m.name}`).gap(8).items_center().px(8).py(6).rounded(6)
+          h_flex().id(`dest-${i}`).gap(8).items_center().px(8).py(5).rounded(6)
             .bg(on ? t.selected : t.surface)
-            .hover((s) => s.bg(on ? t.selected : t.hover))
-            .on_click((_e, cx) => { this.picked = m; cx.notify(); })
-            .child(div().flex_1().child(m.name))
-            .child(div().text_size(11).text_color(t.dim).child(m.here ? "bring it here" : m.ssh)));
+            .hover((el) => el.bg(on ? t.selected : t.hover))
+            .on_click((_e, cx) => { this.picked = s; cx.notify(); })
+            .child(div().w(140).truncate().child(s.name))
+            .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(s.folder)));
       }
     }
     if (this.error) box.child(div().text_size(11.5).text_color(t.ansi1 ?? t.blocked).child(this.error));
-    if (this.output && !this.error) box.child(div().text_size(11.5).text_color(t.muted).child("Moved."));
-    const ready = this.picked && !this.busy && !this.output;
-    return box.child(h_flex().gap(12).items_center()
+    if (this.done) box.child(div().text_size(11.5).text_color(t.muted).child("Moved."));
+    const ready = this.picked && !this.busy && !this.done;
+    const where = this.picked ? `${this.picked.machine || "this computer"} / ${this.picked.name}` : "";
+    return box.child(h_flex().gap(12).items_center().pt(4)
       .child(div().flex_1())
-      .child(div().id("cancel").text_color(t.muted).hover((s) => s.text_color(t.foreground))
+      .child(div().id("cancel").text_color(t.muted).hover((el) => el.text_color(t.foreground))
         .on_click(() => closeOverlay(p.overlay)).child("Close"))
       .child(div().id("move").px(10).py(4).rounded(6)
         .bg(ready ? t.solid : t.border)
         .text_color(ready ? t.solid_foreground : t.dim)
         .on_click((_e, cx) => { if (ready) this.move(cx); })
-        .child(this.busy ? "Moving…" : this.output ? "Done" : this.picked ? `Move to ${this.picked.name}` : "Pick a machine")));
+        .child(this.busy ? "Moving…" : this.done ? "Done" : this.picked ? `Move to ${where}` : "Pick a space")));
   }
 }
