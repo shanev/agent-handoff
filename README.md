@@ -4,9 +4,9 @@
 
 Move a running coding-agent session to another machine and keep going there.
 
-![A grok session handed from sirius to m3max, then asked where it left off](docs/agent-handoff-demo.gif)
+![The Herdr app on m3max after a handoff, with the session in the readme-demo space recalling its passphrase](docs/agent-handoff-demo.gif)
 
-<sub>The terminal text from a real handoff to m3max, with the waits cut. [MP4](docs/agent-handoff-demo.mp4)</sub>
+<sub>The Herdr window on m3max after a real handoff. [MP4](docs/agent-handoff-demo.mp4)</sub>
 
 It moves Claude Code, Codex, omp (oh-my-pi), pi, grok, and OpenCode. Any agent that supports [skills](https://skills.sh) can do the moving, including moving its own session after the current turn ends.
 
@@ -45,6 +45,29 @@ On both machines: [hc](https://herdr.dev/core/) 0.1.13 or newer, with `hc server
 Between them: SSH that works with `ssh -o BatchMode=yes <host> true`, both ways if you want the session back. If the other machine would reach this one by the wrong name, set `AGENT_HANDOFF_SELF=user@host`. Codex's sandbox blocks the network and other agents' session folders, so approve the handoff script outside the sandbox.
 
 The procedure, the prompts, and the limits are in [`skills/agent-handoff/SKILL.md`](skills/agent-handoff/SKILL.md). Every flag: `python3 skills/agent-handoff/scripts/agent_handoff.py send --help`.
+
+## Herdr
+
+`herdr/handoff/` is a mod: a Hand off button for the agent you're looking at. Pick a machine, then confirm. It quits that agent and resumes the same session there.
+
+```sh
+cp -r herdr/handoff ~/.config/herdr-app/mods/
+herdr-app check ~/.config/herdr-app/mods/handoff
+```
+
+Herdr's own layouts are read-only. Clone one and add the button to the status row:
+
+```sh
+herdr-app do layout.clone '{"name":"main","as":"main-handoff"}'
+```
+
+In `~/.config/herdr-app/layouts/main-handoff.json`:
+
+```json
+{ "type": "block", "id": "handoff", "size": { "px": 28 }, "content": { "mod": "handoff" } }
+```
+
+The script has to be installed on the machine where Herdr is running. Set `AGENT_HANDOFF` to the script path if it lives somewhere else.
 
 ## Tests
 
