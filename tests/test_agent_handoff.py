@@ -431,6 +431,18 @@ class GitTransport(TempDirTest):
         with self.assertRaisesRegex(ah.HandoffError, "uncommitted changes"):
             self.prepare()
 
+    def test_untracked_files_do_not_block_the_checkout(self):
+        (self.dst / "pa-accounting").mkdir()
+        (self.dst / "pa-accounting" / "agreement").write_text("local only\n")
+        (self.src / "a.txt").write_text("edited\n")
+        self.handoff_refs()
+        out = self.prepare()
+        self.assertEqual(out["worktree"], os.path.realpath(self.dst))
+        self.assertFalse(out["created_worktree"])
+        self.assertTrue(out["applied_changes"])
+        self.assertEqual((self.dst / "a.txt").read_text(), "edited\n")
+        self.assertEqual((self.dst / "pa-accounting" / "agreement").read_text(), "local only\n")
+
     def test_diverged_target_is_refused_unless_new_branch(self):
         (self.dst / "c.txt").write_text("only on target\n")
         sh("git", "add", "-A", cwd=self.dst)
@@ -501,6 +513,17 @@ class RepoDiscovery(TempDirTest):
         self.assertEqual(ah.load_cache(), {})
         with self.assertRaisesRegex(ah.HandoffError, "no remote matching"):
             ah.find_repo(["github.com/o/elsewhere"], None, repo)
+
+    def test_plain_directory_finds_the_checkout_on_the_machine(self):
+        # A Herdr space folder is often ~, which is not the repo. The repo is still here.
+        want = self.make_repo("github.com/acme/crypto-taxes", "git@github.com:acme/crypto-taxes.git")
+        found, others = ah.find_repo(["github.com/acme/crypto-taxes"], None, str(self.home))
+        self.assertEqual((found, others), (want, []))
+        self.assertEqual(ah.load_cache()["github.com/acme/crypto-taxes"], want)
+
+    def test_missing_dir_is_an_error(self):
+        with self.assertRaisesRegex(ah.HandoffError, "not a directory"):
+            ah.find_repo(["github.com/acme/crypto-taxes"], None, str(self.home / "missing"))
 
     def test_exclude_skips_the_source_checkout(self):
         src = self.make_repo("src/hark", "git@github.com:tensor-systems/hark.git")
@@ -1114,7 +1137,7 @@ class TerminalNames(unittest.TestCase):
 
 
 class AppPlacement(unittest.TestCase):
-    def place(self, responses):
+    def place(self, responses, space=None):
         calls = []
 
         def fake(*args):
@@ -1123,7 +1146,7 @@ class AppPlacement(unittest.TestCase):
             return responses[key]
 
         with mock.patch.object(ah, "herdr_app", side_effect=fake):
-            shown = ah.show_in_app("t9", "demo", "/repo")
+            shown = ah.show_in_app("t9", "demo", "/repo", space)
         return shown, calls
 
     def test_new_space_keeps_the_terminal_and_drops_the_shell_tab(self):
@@ -1139,6 +1162,19 @@ class AppPlacement(unittest.TestCase):
                        "--machine", "", "--focus", "true"), calls)
         self.assertIn(("do", "terminal.keep", "--terminal", "t9", "--place", "tab"), calls)
         self.assertIn(("do", "tab.close", "--id", "tb-shell", "--confirmed", "true"), calls)
+
+    def test_picked_space_is_used_when_its_folder_differs(self):
+        shown, calls = self.place({
+            "ls": {"spaces": [
+                {"id": "sp-home", "name": "crypto-taxes", "folder": "/Users/me", "machine": None},
+                {"id": "sp-repo", "name": "repo", "folder": "/repo", "machine": None},
+            ]},
+            "space.select": {"ok": True},
+            "terminal.keep": {"tab": "tb-agent", "pane": "p1"},
+        }, space="m3max/sp-home")
+        self.assertEqual(shown, {"space": "crypto-taxes", "tab": "tb-agent"})
+        self.assertIn(("do", "space.select", "--id", "sp-home"), calls)
+        self.assertNotIn("space.new", [c[1] for c in calls if c[0] == "do"])
 
     def test_existing_space_for_the_folder_is_reused(self):
         shown, calls = self.place({

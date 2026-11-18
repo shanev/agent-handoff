@@ -64,18 +64,41 @@ function destinations(address, currentSpace) {
 function sendArgs(address, space, rows) {
   const dir = space.folder;
   const slash = address.indexOf("/");
+  let args;
   if (slash === -1) {
     const dest = rows.find((m) => m.name === space.machine);
     if (!dest?.target) throw new Error(`No SSH target for ${space.machine}. Add it with hc machine add.`);
-    return ["send", address, dest.target, "--dir", dir];
+    args = ["send", address, dest.target, "--dir", dir];
+  } else {
+    const source = rows.find((m) => m.name === address.slice(0, slash));
+    if (!source?.target) throw new Error(`No SSH target for ${address.slice(0, slash)}.`);
+    const id = address.slice(slash + 1);
+    if (!space.machine) args = ["send", id, "--from", source.target, "--dir", dir];
+    else {
+      const dest = rows.find((m) => m.name === space.machine);
+      if (!dest?.target) throw new Error(`No SSH target for ${space.machine}.`);
+      args = ["send", id, dest.target, "--from", source.target, "--dir", dir];
+    }
   }
-  const source = rows.find((m) => m.name === address.slice(0, slash));
-  if (!source?.target) throw new Error(`No SSH target for ${address.slice(0, slash)}.`);
-  const id = address.slice(slash + 1);
-  if (!space.machine) return ["send", id, "--from", source.target, "--dir", dir];
-  const dest = rows.find((m) => m.name === space.machine);
-  if (!dest?.target) throw new Error(`No SSH target for ${space.machine}.`);
-  return ["send", id, dest.target, "--from", source.target, "--dir", dir];
+  // The space's folder is often not the checkout (a shell started at ~). The
+  // id still says which space the resumed terminal should show in.
+  if (space.id) args.push("--space", space.id);
+  return args;
+}
+
+// Everything the command wrote. A failed send prints pretty-printed JSON, so the
+// last line is "}" and the message is the "error" field above it.
+function failureText(stdout, stderr, code) {
+  const out = String(stdout || "").trim();
+  const err = String(stderr || "").trim();
+  let okFalse = false;
+  if (out) {
+    try {
+      okFalse = JSON.parse(out).ok === false;
+    } catch (_) { /* stdout is not one JSON value; keep it verbatim */ }
+  }
+  if (code === 0 && !okFalse) return null;
+  return [out, err].filter(Boolean).join("\n") || `exit ${code}`;
 }
 
 export default class Handoff extends View {
@@ -94,7 +117,7 @@ export default class Handoff extends View {
     cx.spawn(async (cx) => {
       try {
         const r = await hc(["machine", "ls"]);
-        if (r.code !== 0) throw new Error((r.stderr || r.stdout || `exit ${r.code}`).trim());
+        if (r.code !== 0) throw new Error(failureText(r.stdout, r.stderr, r.code));
         this.rows = JSON.parse(r.stdout).machines || [];
       } catch (e) {
         this.rows = [];
@@ -120,8 +143,8 @@ export default class Handoff extends View {
     cx.spawn(async (cx) => {
       try {
         const r = await exec("/bin/sh", ["-c", FIND, "agent-handoff", ...args], { timeout: 600000 });
-        const text = `${r.stdout || ""}${r.stderr || ""}`.trim();
-        if (r.code !== 0) this.error = text.split("\n").filter(Boolean).pop() || `exit ${r.code}`;
+        const failure = failureText(r.stdout, r.stderr, r.code);
+        if (failure) this.error = failure;
         else this.done = true;
       } catch (e) {
         this.error = String(e?.message ?? e);
@@ -166,7 +189,7 @@ export default class Handoff extends View {
       .text_size(12.5).text_color(t.foreground).overflow_y_scrollbar();
     box.child(div().font_semibold().child(`Move ${p.label || "agent"}`));
     box.child(div().text_size(11.5).text_color(t.muted)
-      .child("Pick a space on another machine. This quits the agent and resumes it in that folder."));
+      .child("Pick a space on another machine. This quits the agent and resumes it there."));
     if (this.rows == null) box.child(div().text_color(t.muted).child("Looking up machines…"));
     else if (!groups.length) box.child(div().text_color(t.muted).child(
       waiting.length ? "Waiting for the other machine…" : "No spaces on another machine yet."));
@@ -185,7 +208,13 @@ export default class Handoff extends View {
             .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(s.folder)));
       }
     }
-    if (this.error) box.child(div().text_size(11.5).text_color(t.ansi1 ?? t.blocked).child(this.error));
+    if (this.error) {
+      const block = div().id("handoff-error").text_size(11.5).text_color(t.ansi1 ?? t.blocked);
+      for (const line of this.error.split("\n")) {
+        block.child(div().min_w(0).whitespace_normal().child(line || " "));
+      }
+      box.child(block);
+    }
     if (this.done) box.child(div().text_size(11.5).text_color(t.muted).child("Moved."));
     const ready = this.picked && !this.busy && !this.done;
     const where = this.picked ? `${this.picked.machine || "this computer"} / ${this.picked.name}` : "";

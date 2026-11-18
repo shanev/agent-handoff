@@ -1,7 +1,7 @@
 ---
 name: agent-handoff
 description: "Move a running coding-agent session (Claude Code, Codex, omp, pi, grok, OpenCode) from one machine to another over SSH, with its transcript, branch and uncommitted changes, and resume it in an hc terminal on the target. Use when the user asks to hand off, move, transfer, or continue an agent session on another machine/host (e.g. 'move the hark claude to vega'), or on this machine into another checkout or its own worktree. Requires hc on both machines."
-version: 0.6.2
+version: 0.6.3
 author: Shane Vitarana
 license: MIT
 platforms: [macos, linux]
@@ -19,7 +19,7 @@ One handoff does all of this:
 4. Pushes `HEAD` plus a snapshot of uncommitted changes **straight to the target over ssh** (`refs/handoff/*`, removed afterwards). Nothing is pushed to GitHub, and no branch on either side is rewritten.
 5. On the target: fast-forwards the branch where it is already checked out, or else makes a worktree next to the repo (`<repo>.worktrees/<branch>`), then applies the uncommitted changes.
 6. Copies the transcript into the target agent's session store (honouring `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `PI_CODING_AGENT_DIR`, `GROK_HOME` and `OPENCODE_DATA_DIR` on either side), replacing the old repo path, home directory and config folder with the new ones inside it. OpenCode keeps every session in one database, so this step exports that session to JSON and imports it into the target directory.
-7. Resumes the agent in a new terminal (`hc run` a shell, then the resume command). Codex is started with `--no-daemon`, and OpenCode with `--standalone`, because otherwise their commands run outside the terminal. If the agent asks whether to trust the folder, the script answers yes: the user was already working in this repo on the source. Pass `--no-trust` to leave that question for the user. When the Herdr app is running on the target, the terminal is given a pane in the space for that folder (a new space if there isn't one), so it shows in the window.
+7. Resumes the agent in a new terminal (`hc run` a shell, then the resume command). Codex is started with `--no-daemon`, and OpenCode with `--standalone`, because otherwise their commands run outside the terminal. If the agent asks whether to trust the folder, the script answers yes: the user was already working in this repo on the source. Pass `--no-trust` to leave that question for the user. When the Herdr app is running on the target, the terminal is given a pane in the space that was picked (`--space`), or else the space for that folder (a new space if there isn't one), so it shows in the window.
 8. Stashes the uncommitted changes in the source checkout (`git stash list` shows them), so a later handoff back applies cleanly.
 
 If anything fails after step 3, including the agent exiting straight after it starts on the target, the script restarts the agent where it was and reports why.
@@ -84,8 +84,8 @@ Running `doctor` to diagnose is fine. Retrying with a corrected name the user ga
 
 | Flag | Use |
 |---|---|
-| `--dir PATH` | Use this checkout on the target (skips discovery). |
-| `--new-branch` | Put the work on `handoff/<id>` on the target. Use when the target's copy of the branch is dirty or has diverged; the error message says when. |
+| `--dir PATH` | Use this checkout on the target. If PATH is not itself a checkout of the repo, the checkout is found on the machine instead. |
+| `--new-branch` | Put the work on `handoff/<id>` on the target. Use when the target's copy of the branch has tracked changes or has diverged; the error message says when. Untracked files in that checkout are left alone and do not block the move. |
 | `--keep-source-changes` | Don't stash the source checkout afterwards. |
 | `--name NAME` | Agent name on the target (defaults to the source name, or `<repo>-<kind>`). |
 | `--session ID_OR_PATH` | Session to move. Required when the transcript guess is ambiguous (hc does not record session ids). |

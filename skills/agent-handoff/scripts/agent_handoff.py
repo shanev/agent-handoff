@@ -28,7 +28,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-VERSION = "0.6.2"
+VERSION = "0.6.3"
 RESULT_MARK = "AGENT_HANDOFF_RESULT:"
 HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "agent-handoff"
@@ -236,8 +236,13 @@ def remotes_of(repo: str) -> List[str]:
     return sorted({normalize_remote(line.split(None, 1)[1]) for line in out.splitlines() if " " in line})
 
 
-def is_dirty(repo: str) -> bool:
-    return bool(git(repo, "status", "--porcelain"))
+def is_dirty(repo: str, untracked: bool = True) -> bool:
+    """Untracked files are not changes to the checkout. A handoff can resume
+    there without touching them; tracked edits still have to be left alone."""
+    args = ["status", "--porcelain"]
+    if not untracked:
+        args.append("--untracked-files=no")
+    return bool(git(repo, *args))
 
 
 def worktrees(repo: str) -> List[dict]:
@@ -1107,31 +1112,40 @@ def save_cache(cache: Dict[str, str]) -> None:
     (CONFIG_DIR / "repos.json").write_text(json.dumps(cache, indent=2, sort_keys=True) + "\n")
 
 
+def is_checkout(path: str) -> bool:
+    git_dir = os.path.join(path, ".git")
+    return os.path.isdir(git_dir) or os.path.isfile(git_dir)
+
+
 def find_repo(remotes: List[str], branch: Optional[str], override: Optional[str],
               exclude: Tuple[str, ...] = ()) -> Tuple[str, List[str]]:
     if override:
         path = os.path.realpath(os.path.expanduser(override))
-        if not set(remotes) & set(remotes_of(path)):
-            raise HandoffError(f"{path} has no remote matching {remotes}")
-        matches = [path]
-    else:
-        cache = load_cache()
-        cached = [cache[r] for r in remotes
-                  if r in cache and os.path.isdir(cache[r]) and cache[r] not in exclude]
-        matches = [p for p in cached if set(remotes) & set(remotes_of(p))]
-        if not matches:
-            seen = set()
-            for root, depth in scan_roots():
-                for repo in iter_repos(root, depth):
-                    real = os.path.realpath(repo)
-                    if real in seen or real in exclude:
-                        continue
-                    seen.add(real)
-                    if set(remotes) & set(remotes_of(real)):
-                        matches.append(real)
-        if not matches:
-            raise HandoffError(f"no checkout of {remotes[0]} found on this machine "
-                               f"(clone it, or pass --dir; searched {[str(r) for r, _ in scan_roots()]})")
+        if not os.path.isdir(path):
+            raise HandoffError(f"{path} is not a directory")
+        # A named checkout has to be this repo. A plain directory, such as a
+        # Herdr space whose folder is ~, is not one: look the repo up instead.
+        if is_checkout(path):
+            if not set(remotes) & set(remotes_of(path)):
+                raise HandoffError(f"{path} has no remote matching {remotes}")
+            return path, []
+    cache = load_cache()
+    cached = [cache[r] for r in remotes
+              if r in cache and os.path.isdir(cache[r]) and cache[r] not in exclude]
+    matches = [p for p in cached if set(remotes) & set(remotes_of(p))]
+    if not matches:
+        seen = set()
+        for root, depth in scan_roots():
+            for repo in iter_repos(root, depth):
+                real = os.path.realpath(repo)
+                if real in seen or real in exclude:
+                    continue
+                seen.add(real)
+                if set(remotes) & set(remotes_of(real)):
+                    matches.append(real)
+    if not matches:
+        raise HandoffError(f"no checkout of {remotes[0]} found on this machine "
+                           f"(clone it, or pass --dir; searched {[str(r) for r, _ in scan_roots()]})")
 
     def rank(path: str):
         has_branch = branch is not None and any(
@@ -1142,11 +1156,11 @@ def find_repo(remotes: List[str], branch: Optional[str], override: Optional[str]
         return (not has_branch, -mtime)
 
     matches.sort(key=rank)
-    if not override:  # remember discoveries, not one-off --dir choices
-        cache = load_cache()
-        for r in remotes:
-            cache[r] = matches[0]
-        save_cache(cache)
+    # A directory that is not itself the checkout fell through to discovery.
+    cache = load_cache()
+    for r in remotes:
+        cache[r] = matches[0]
+    save_cache(cache)
     return matches[0], matches[1:]
 
 
@@ -1188,7 +1202,7 @@ def step_prepare(p: dict) -> dict:
     created = False
     if current:
         path = current[0]["worktree"]
-        if is_dirty(path):
+        if is_dirty(path, untracked=False):
             raise HandoffError(f"{path} has '{branch}' checked out with uncommitted changes; "
                                f"commit/stash there, or rerun with --new-branch")
         if git(path, "rev-parse", "HEAD") != head:
@@ -1267,21 +1281,24 @@ def herdr_app(*args: str) -> Optional[dict]:
     return data if isinstance(data, dict) else None
 
 
-def show_in_app(addr: str, name: str, cwd: str) -> Optional[dict]:
+def show_in_app(addr: str, name: str, cwd: str, space: Optional[str] = None) -> Optional[dict]:
     """Give a core terminal a pane in the Herdr window. None when the app isn't
     running: the terminal still exists, and `hc attach` reaches it."""
     try:
-        return _show_in_app(addr, name, cwd)
+        return _show_in_app(addr, name, cwd, space)
     except HandoffError:
         return None
 
 
-def _show_in_app(addr: str, name: str, cwd: str) -> Optional[dict]:
+def _show_in_app(addr: str, name: str, cwd: str, space_id: Optional[str] = None) -> Optional[dict]:
     listing = herdr_app("ls")
     if not listing or "spaces" not in listing:
         return None
     cwd_real = os.path.realpath(cwd)
-    space = next((s for s in listing["spaces"]
+    bare = space_id.split("/", 1)[1] if space_id and "/" in space_id else space_id
+    picked = next((s for s in listing["spaces"]
+                   if space_id and not s.get("machine") and s.get("id") in (space_id, bare)), None)
+    space = picked or next((s for s in listing["spaces"]
                   if not s.get("machine") and s.get("folder")
                   and os.path.realpath(os.path.expanduser(s["folder"])) == cwd_real), None)
     shell_tab = None
@@ -1386,7 +1403,7 @@ def step_start(p: dict) -> dict:
     if state == "blocked" and not waiting:
         waiting = ["unrecognized_prompt"]
     return {"name": name, "pane_id": addr, "trust_prompt": trust, "waiting_for_user": waiting,
-            "app": show_in_app(addr, name, p["cwd"])}
+            "app": show_in_app(addr, name, p["cwd"], p.get("space"))}
 
 
 def discard_terminal(addr: str) -> None:
@@ -1712,6 +1729,7 @@ def cmd_send(args) -> None:
         name = agent_name_for(args.name, agent.get("name"), kind, src_root)
         started = remote(args.target, "start", {
             "kind": kind, "name": name, "cwd": dst_cwd, "trust": not args.no_trust,
+            "space": args.space,
             "prelude": adapter.prelude(dst_handle, dst_cwd, mapping),
             "args": adapter.resume_args(dst_handle) + list(args.agent_args)})
     except Exception:
@@ -1800,7 +1818,9 @@ def main() -> None:
                         "or a new worktree")
     s.add_argument("--new-worktree", action="store_true",
                    help="with --here: move the session into a new worktree of the same repo")
-    s.add_argument("--dir", help="checkout to use on the target (skips discovery)")
+    s.add_argument("--dir", help="checkout to use on the target. A directory that is not "
+                   "itself a checkout does not block the move; the repo is found on the machine")
+    s.add_argument("--space", help="Herdr space id to show the resumed terminal in")
     s.add_argument("--name", help="agent name on the target")
     s.add_argument("--session", help="session id or path, when the transcript guess is ambiguous")
     s.add_argument("--new-branch", action="store_true",
